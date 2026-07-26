@@ -87,27 +87,77 @@ def _hkdf_derive(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
 
 
 def nip44_encrypt(plaintext: str, conversation_key: bytes) -> str:
-    """NIP-44 encrypt. Returns base64 ciphertext."""
+    """NIP-44 v2 encrypt. Returns base64 payload."""
     import base64
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+    from cryptography.hazmat.primitives import hashes
+    import hmac as hmac_mod
+    import hashlib
 
-    nonce = os.urandom(12)
-    aesgcm = AESGCM(conversation_key)
+    # NIP-44 v2: derive per-message key
+    # 1. HKDF-Expand(PRK=conversation_key, info="nip44-v2", L=32)
+    hkdf_expand = HKDFExpand(
+        algorithm=hashes.SHA256(),
+        length=32,
+        info=b"nip44-v2",
+    )
+    chacha_key = hkdf_expand.derive(conversation_key)
+
+    # 2. Generate random nonce (32 bytes)
+    nonce = os.urandom(32)
+
+    # 3. HMAC-SHA256(chacha_key, nonce) -> actual encryption key
+    h = hmac_mod.new(chacha_key, nonce, hashlib.sha256)
+    enc_key = h.digest()
+
+    # 4. Encrypt with ChaCha20Poly1305, nonce=zero(12)
+    cipher = ChaCha20Poly1305(enc_key)
     pt_bytes = plaintext.encode("utf-8")
-    ct = aesgcm.encrypt(nonce, pt_bytes, None)
-    # NIP-44 format: nonce(12) || ciphertext
-    payload = nonce + ct
+    ct = cipher.encrypt(b"\x00" * 12, pt_bytes, None)
+
+    # 5. Payload: version(1) + nonce(32) + ciphertext+mac
+    payload = bytes([0x02]) + nonce + ct
     return base64.b64encode(payload).decode()
 
 
 def nip44_decrypt(ciphertext_b64: str, conversation_key: bytes) -> str:
-    """NIP-44 decrypt. Returns plaintext string."""
+    """NIP-44 v2 decrypt. Returns plaintext string."""
     import base64
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+    from cryptography.hazmat.primitives import hashes
+    import hmac as hmac_mod
+    import hashlib
 
     payload = base64.b64decode(ciphertext_b64)
-    nonce = payload[:12]
-    ct = payload[12:]
-    aesgcm = AESGCM(conversation_key)
-    pt = aesgcm.decrypt(nonce, ct, None)
+
+    # Parse NIP-44 v2 payload: version(1) + nonce(32) + ciphertext+mac(rest)
+    if len(payload) < 1:
+        raise ValueError("Empty payload")
+    version = payload[0]
+    if version != 0x02:
+        raise ValueError(f"Unsupported NIP-44 version: {version}")
+
+    nonce = payload[1:33]
+    ct_with_mac = payload[33:]
+
+    # Derive per-message key
+    # 1. HKDF-Expand(PRK=conversation_key, info="nip44-v2", L=32)
+    hkdf_expand = HKDFExpand(
+        algorithm=hashes.SHA256(),
+        length=32,
+        info=b"nip44-v2",
+    )
+    chacha_key = hkdf_expand.derive(conversation_key)
+
+    # 2. HMAC-SHA256(chacha_key, nonce) -> actual encryption key
+    h = hmac_mod.new(chacha_key, nonce, hashlib.sha256)
+    enc_key = h.digest()
+
+    # 3. Decrypt with ChaCha20Poly1305, nonce=zero(12)
+    cipher = ChaCha20Poly1305(enc_key)
+    pt = cipher.decrypt(b"\x00" * 12, ct_with_mac, None)
     return pt.decode("utf-8")
 
 
@@ -440,10 +490,16 @@ class RelayPool:
         for q in self._queues.values():
             await q.put(msg)
 
-    async def subscribe(self, kinds: list[int], authors: list[str] | None = None) -> str:
+    async def subscribe(self, kinds: list[int], authors: list[str] | None = None, p_tags: list[str] | None = None) -> str:
         sub_id = uuid.uuid4().hex[:12]
         self._sub_id = sub_id
-        sub = json.dumps(["REQ", sub_id, {"kinds": kinds, "authors": authors}])
+        filt: dict[str, Any] = {"kinds": kinds}
+        if authors is not None:
+            filt["authors"] = authors
+        if p_tags is not None:
+            filt["#p"] = p_tags
+        sub = json.dumps(["REQ", sub_id, filt])
+        logger.debug(f"Subscribing with filter: {filt}")
         for q in self._queues.values():
             await q.put(sub)
         return sub_id
@@ -507,9 +563,17 @@ class RelayPool:
             async for raw in ws:
                 try:
                     data = json.loads(raw)
+                    logger.debug(f"{relay_url} recv: {data[0] if data else '?'}")
                     if data[0] == "EVENT":
                         await self._incoming.put((relay_url, data[2]))
-                except (json.JSONDecodeError, IndexError):
+                    elif data[0] == "EOSE":
+                        logger.debug(f"{relay_url} EOSE for sub {data[1]}")
+                    elif data[0] == "NOTICE":
+                        logger.warning(f"{relay_url} NOTICE: {data[1] if len(data) > 1 else '?'}")
+                    elif data[0] == "OK":
+                        logger.debug(f"{relay_url} OK: {data[1:] if len(data) > 1 else ''}")
+                except (json.JSONDecodeError, IndexError) as e:
+                    logger.debug(f"{relay_url} parse error: {e}")
                     continue
         except asyncio.CancelledError:
             pass
@@ -543,27 +607,27 @@ class Nip46Handler:
 
     async def handle_request(self, event: dict[str, Any]) -> dict[str, Any] | None:
         """Handle an incoming NIP-46 request event. Returns response event or None."""
-        try:
-            content = json.loads(event["content"])
-        except (json.JSONDecodeError, KeyError):
-            logger.warning(f"Invalid event content: {event.get('content', '')[:100]}")
-            return None
+        raw_content = event.get("content", "")
+        client_pubkey = event.get("pubkey", "")
 
-        # NIP-46 request format: [request_id, method, params]
-        if not isinstance(content, list) or len(content) < 2:
-            return None
-
-        # If encrypted, it's encrypted content -> need to decrypt first
-        # Check if content is encrypted (looks like base64)
-        if isinstance(event["content"], str) and not event["content"].startswith("["):
-            # Encrypted request from a client we know
-            client_pubkey = event.get("pubkey", "")
+        # NIP-46 requests are NIP-44 encrypted. Try to decrypt first.
+        content = None
+        if raw_content.startswith("["):
+            # Unencrypted (rare, some test clients)
+            try:
+                content = json.loads(raw_content)
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid unencrypted content: {raw_content[:100]}")
+                return None
+        else:
+            # Encrypted — decrypt with NIP-44
             try:
                 conv_key = self.get_conversation_key_for(client_pubkey)
-                decrypted = nip44_decrypt(event["content"], conv_key)
+                decrypted = nip44_decrypt(raw_content, conv_key)
                 content = json.loads(decrypted)
+                logger.debug(f"Decrypted request from {client_pubkey[:16]}...: method={content[1] if len(content) > 1 else '?'}")
             except Exception as e:
-                logger.warning(f"Failed to decrypt request from {client_pubkey}: {e}")
+                logger.warning(f"Failed to decrypt request from {client_pubkey[:16]}...: {e}")
                 return None
 
         if not isinstance(content, list) or len(content) < 2:
@@ -774,7 +838,7 @@ class BunkerDaemon:
         await self.pool.start()
         self._sub_id = await self.pool.subscribe(
             kinds=[NIP_46_KIND],
-            authors=None,  # Listen for all, filter by auth
+            # Receive all kind 24133 events, filter by p-tag in handler
         )
         logger.info("Listening for NIP-46 requests...")
 
