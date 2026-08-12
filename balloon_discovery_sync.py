@@ -238,9 +238,29 @@ def update_discoveries_file(new_entries: list[tuple[str, dict, list[str]]]) -> i
 
 # ── Signal Notification ────────────────────────────────────────────────
 
+def track_has_recent_activity(track_name: str, days: int = 7) -> bool:
+    """Check if a track's worktree has commits within the last N days."""
+    worktree = HOME / "worktrees" / track_name
+    if not worktree.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "log", "--oneline", f"--since={days} days ago"],
+            capture_output=True, text=True, cwd=worktree, timeout=10,
+        )
+        return bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
 def notify_track(track_name: str, signal_target: str, discoveries: list[dict], dry_run: bool = False):
-    """Send a brief notification to a track's Signal group about relevant discoveries."""
+    """Send a brief notification to a track's Signal group about relevant discoveries.
+    Only notifies if the track has had recent git activity (idle tracks don't get spammed)."""
     if not discoveries:
+        return
+
+    # Activity gate: don't spam idle tracks with cross-track notifications
+    if not track_has_recent_activity(track_name, days=7):
         return
 
     # Build concise notification (Signal = no markdown)
