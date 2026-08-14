@@ -17,12 +17,13 @@ LOG_TAG="staggered-dispatch"
 log() { logger -t "$LOG_TAG" -- "$*" 2>/dev/null || printf '[%s] %s\n' "$LOG_TAG" "$*" >&2; }
 
 # --- Config (overridable via env) ---
-LOAD_THRESHOLD="${LOAD_THRESHOLD:-3.0}"
+LOAD_THRESHOLD="${LOAD_THRESHOLD:-3.4}"
 RAM_MIN_MB="${RAM_MIN_MB:-1500}"          # 1.5 GB
-SLEEP_BETWEEN="${SLEEP_BETWEEN:-60}"      # seconds between board passes
+SLEEP_BETWEEN="${SLEEP_BETWEEN:-30}"      # seconds between board passes
 FAILURE_LIMIT="${FAILURE_LIMIT:-5}"
 GATE_FILE="${GATE_FILE:-$HOME/.hermes/state/rate_limit_gate.json}"
-BOARDS="${BOARDS:-fips infrastructure}"
+BOARDS="${BOARDS:-fips infrastructure hermes-for-friends}"
+HERMES_BIN="${HERMES_BIN:-/home/c03rad0r/.hermes/hermes-agent/venv/bin/hermes}"
 
 # --- flock: prevent overlapping runs ---
 LOCK_FILE="${LOCK_FILE:-/tmp/staggered-dispatch.lock}"
@@ -92,7 +93,7 @@ for board in $BOARDS; do
     check_gate || break
     check_resources "$board" || break
     log "dispatching board=$board max=1 failure-limit=$FAILURE_LIMIT"
-    if hermes kanban --board "$board" dispatch --max 1 --failure-limit "$FAILURE_LIMIT" 2>&1; then
+    if "$HERMES_BIN" kanban --board "$board" dispatch --max 1 --failure-limit "$FAILURE_LIMIT" 2>&1; then
         spawned=$((spawned + 1))
     else
         log "dispatch board=$board returned rc=$? (nothing-ready or transient) — continuing"
