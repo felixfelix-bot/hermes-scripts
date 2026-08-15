@@ -10,6 +10,7 @@ Run:
     python3 -m pytest tests/ -q   (if pytest available)
 """
 
+import json
 import os
 import sqlite3
 import sys
@@ -220,6 +221,67 @@ class TestCollect503Events(unittest.TestCase):
         events = gate.collect_503_events_api(conn, now=NOW)
         self.assertEqual(len(events), 4)  # window clamp drops the -700 one
         self.assertEqual(events[0]["source"], "api_calls")
+
+    def test_api_calls_timeout_502_and_504_collected(self):
+        # Real-world outage class (2026-08-15 evidence, t_8e2673cd): z.ai read
+        # timeouts surface ONLY as tier='zai' status_code=502 rows in api_calls
+        # ('proxy error: The read operation timed out') — no anomaly rows.
+        # The api_calls collector must count 502 and 504 alongside 503.
+        conn = self._conn()
+        rows = [(-20, 502), (-80, 502), (-140, 504)]
+        for off, code in rows:
+            conn.execute(
+                "INSERT INTO api_calls (ts, key_name, tier, status_code, error)"
+                " VALUES (?,?,?,?,?)",
+                (NOW + off, "friend", "zai", code,
+                 "proxy error: The read operation timed out"))
+        events = gate.collect_503_events_api(conn, now=NOW)
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0]["source"], "api_calls")
+
+    def test_api_calls_external_tier_5xx_ignored(self):
+        # Failover paths log their own per-provider attempts with
+        # tier=<provider_name>; a failing external provider while z.ai is
+        # healthy is NOT a z.ai outage and must not trip zai-503-outage.
+        conn = self._conn()
+        for off in (-20, -80, -140):
+            conn.execute(
+                "INSERT INTO api_calls (ts, key_name, tier, status_code, error)"
+                " VALUES (?,?,?,?,?)",
+                (NOW + off, "friend", "deepinfra", 503, "upstream capacity"))
+        events = gate.collect_503_events_api(conn, now=NOW)
+        self.assertEqual(events, [])
+
+    def test_real_proxy_anomaly_format_collected(self):
+        # Byte-realistic fixture: zai_proxy._log_anomaly JSON-wraps the
+        # payload as {"detail": ..., "key_name": ...} into anomaly_events.
+        conn = self._conn()
+        for i, off in enumerate((-30, -90, -150)):
+            conn.execute(
+                "INSERT INTO anomaly_events (ts, severity, category, title,"
+                " detail) VALUES (?,?,?,?,?)",
+                (NOW + off, "WARN", "key_backoff",
+                 f"ours server failure #{i+1}",
+                 json.dumps({"detail": "backoff 30s; error_type=server",
+                             "key_name": "ours"})))
+        events = gate.collect_503_events_anomaly(conn, now=NOW)
+        self.assertEqual(len(events), 3)
+        self.assertTrue(all(e["retry_after_s"] == 30 for e in events))
+
+    def test_real_proxy_anomaly_float_backoff_hint(self):
+        # If _SERVER_ERROR_BACKOFF_SECONDS ever becomes a computed float the
+        # detail string is 'backoff 12.5s; error_type=server' — the hint
+        # parser must stay float-safe inside the JSON-wrapped detail.
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO anomaly_events (ts, severity, category, title,"
+            " detail) VALUES (?,?,?,?,?)",
+            (NOW - 30, "WARN", "key_backoff", "ours server failure #1",
+             json.dumps({"detail": "backoff 12.5s; error_type=server",
+                         "key_name": "ours"})))
+        events = gate.collect_503_events_anomaly(conn, now=NOW)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["retry_after_s"], 12.5)
 
     def test_missing_tables_fail_open(self):
         conn = sqlite3.connect(":memory:")

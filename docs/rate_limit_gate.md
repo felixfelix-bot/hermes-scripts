@@ -34,9 +34,16 @@ Exit codes: 0 = clear, 1 = paused.
    - `zai_usage.db anomaly_events`: `key_backoff` rows with
      `error_type=server` (the proxy records every upstream 500/502/503/504
      with a `backoff Ns` hint — the Retry-After proxy).
-   - `zai_usage.db api_calls`: `status_code = 503` rows (future-proof).
+   - `zai_usage.db api_calls`: zai-tier rows with
+     `status_code IN (502, 503, 504)` — covers the read-timeout outage
+     class (2026-08-15), which the proxy returns to clients as 502
+     `proxy error: ...` without an anomaly row. External-provider failover
+     attempts (`tier = <provider>`) are excluded; NULL tier (legacy rows)
+     is included.
    - `journalctl -u zai-proxy.service` (best-effort; unreadable journal →
-     skipped, fail-open — the DB sources are primary).
+     skipped, fail-open — the DB sources are primary). When journalctl
+     returns rc=0 with zero lines (journal-perm death under the cron
+     user), one stderr WARN per run names the dead source.
 2. **recent_429** — any 429 in the last 5 min → paused ~60 s (longer when a
    retry hint exists).
 3. **quota_windows** (T3.1, advisory pause, fail-open) — any 5-hour /

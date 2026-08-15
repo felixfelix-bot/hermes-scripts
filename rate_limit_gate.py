@@ -360,11 +360,24 @@ def collect_503_events_anomaly(conn, now):
 
 
 def collect_503_events_api(conn, now):
-    """Collect 503 rows from api_calls (if the proxy starts logging them)."""
+    """Collect upstream 5xx rows from api_calls (zai tier only).
+
+    The proxy logs every request through the z.ai path with tier='zai':
+    upstream 503s, 'all providers exhausted' 503s, and — the only outage
+    class actually observed in production (2026-08-15 read timeouts) —
+    generic-exception failures, which the proxy returns to clients as 502
+    'proxy error: ...'. External failover attempts log their own rows with
+    tier=<provider_name>; a failing external provider while z.ai is healthy
+    is NOT a z.ai outage, so those rows are excluded. NULL tier (legacy
+    pre-RP-1 rows) stays visible — in that era only the zai path wrote
+    5xx rows at all.
+    """
     try:
         rows = conn.execute(
             """SELECT ts FROM api_calls
-               WHERE status_code = 503 AND ts >= ?
+               WHERE status_code IN (502, 503, 504)
+                 AND (tier = 'zai' OR tier IS NULL)
+                 AND ts >= ?
                ORDER BY ts""",
             (now - RECENT_503_WINDOW,),
         ).fetchall()
@@ -388,6 +401,14 @@ def collect_503_events_journal(now):
         )
         if proc.returncode != 0:
             return []
+        if not proc.stdout.strip():
+            # rc=0 with zero lines usually means journal-permission death
+            # under the cron user (t_faa7c86f finding 2): the source is
+            # dead, not the proxy quiet. Surface it once per run on stderr
+            # so cron output shows the journal source is not contributing.
+            print(f"WARN: journalctl -u {PROXY_JOURNAL_UNIT} returned 0 "
+                  f"lines (journal perms?) — journal 503 source dead this "
+                  f"run; relying on DB sources", file=sys.stderr)
     except Exception:
         return []
     cutoff = now - RECENT_503_WINDOW

@@ -182,6 +182,41 @@ class TestRunGateWiring(unittest.TestCase):
         self.assertIn("zai-503-outage", result["reason"])
         self.assertEqual(result["checks"]["recent_503"]["source"], "anomaly")
 
+    def test_timeout_burst_502_pauses_via_run_gate(self):
+        # The only real outage class observed in production (2026-08-15):
+        # three z.ai read timeouts leave ONLY tier='zai' 502 rows in
+        # api_calls — zero anomaly rows. run_gate must still pause with a
+        # zai-* reason (HIGH finding, t_8e2673cd), and an external
+        # provider's 503 attempt rows must not inflate the count.
+        import time as _t
+        dbfile = self._dbfile()
+        conn = sqlite3.connect(dbfile)
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO api_calls (ts, key_name, tier, status_code,"
+                " error) VALUES (?,?,?,?,?)",
+                (_t.time() - 30 * (i + 1), "friend", "zai", 502,
+                 "proxy error: The read operation timed out"))
+        conn.execute(
+            "INSERT INTO api_calls (ts, key_name, tier, status_code, error)"
+            " VALUES (?,?,?,?,?)",
+            (_t.time() - 45, "friend", "deepinfra", 503, "upstream capacity"))
+        conn.commit()
+        conn.close()
+        healthy = {"ours": {"windows": [
+            {"name": "5-hour", "used_pct": 10, "resets_at": NOW + 600,
+             "window_hours": 5}], "age_s": 5}}
+        with mock.patch.object(gate, "collect_503_events_journal",
+                               return_value=[]), \
+             mock.patch.object(gate, "fetch_quota_payload",
+                               return_value=healthy):
+            result = gate.run_gate(db_path=dbfile)
+        self.assertTrue(result["paused"])
+        self.assertIn("zai-503-outage", result["reason"])
+        self.assertTrue(result["reason"].startswith("zai-"))
+        self.assertEqual(result["checks"]["recent_503"]["source"], "api_calls")
+        self.assertEqual(result["checks"]["recent_503"]["count"], 3)
+
     def test_missing_db_still_evaluates_quota(self):
         hot = {"ours": {"windows": [
             {"name": "5-hour", "used_pct": 90, "resets_at": NOW + 600,
@@ -214,6 +249,32 @@ class TestCollectorErrorPaths(unittest.TestCase):
             events = gate.collect_503_events_journal(now=1780000500.0)
         self.assertEqual(len(events), 1)  # PID-503 line must not count
         self.assertEqual(events[0]["source"], "journal")
+
+    def test_journal_rc0_zero_lines_warns_once(self):
+        # Production reality (t_faa7c86f finding 2): as the cron user,
+        # journalctl returns rc=0 with 0 lines (journal perms) — the source
+        # is silently dead. The collector must emit exactly one stderr WARN
+        # naming the unit so the dead source is visible in cron output.
+        import contextlib
+        import io
+        proc = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(gate.subprocess, "run", return_value=proc), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            events = gate.collect_503_events_journal(now=1780000500.0)
+        self.assertEqual(events, [])
+        self.assertEqual(err.getvalue().count("WARN"), 1)
+        self.assertIn("zai-proxy.service", err.getvalue())
+
+    def test_journal_with_lines_does_not_warn(self):
+        import contextlib
+        import io
+        lines = "1780000000.0 h p[1]: upstream 503 error\n"
+        proc = mock.Mock(returncode=0, stdout=lines, stderr="")
+        with mock.patch.object(gate.subprocess, "run", return_value=proc), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            events = gate.collect_503_events_journal(now=1780000500.0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(err.getvalue().count("WARN"), 0)
 
     def test_float_backoff_hint_parsed(self):
         conn = sqlite3.connect(":memory:")
