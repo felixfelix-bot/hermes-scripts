@@ -1,1 +1,0 @@
-/home/c03rad0r/.hermes/bot/code_index.py
