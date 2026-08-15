@@ -313,6 +313,20 @@ t14_quota_window_and_kalman_reasons_are_quota_class() {
     assert_file_exists "$(marker_for alpha)" "t14: KALMAN writes marker"
 }
 
+t15_tab_in_reason_does_not_shift_fields() {
+    # regression: gate reason containing a tab must not corrupt
+    # GATE_REASON/GATE_RESUME_AT field parsing (reason is the LAST field).
+    # JSON source uses the escaped form 	 (raw control chars are invalid
+    # JSON); json.load decodes it to a real tab before the dispatcher sees it.
+    new_env
+    write_gate true '"2026-08-15T12:00:00+00:00"' 'zai-503-outage: a	b'
+    local expected='zai-503-outage: a'$'	''b'
+    run_dispatch
+    assert_file_exists "$(marker_for alpha)" "t15: marker written despite tab in reason"
+    assert_eq "$(marker_field alpha reason)" "$expected" "t15: full tabbed reason preserved"
+    assert_eq "$(marker_field alpha resume_at)" "2026-08-15T12:00:00+00:00" "t15: resume_at not shifted by tab"
+}
+
 # ---------- run ----------
 echo "== T3.2 staggered-dispatch integration tests =="
 TEST_FILTER="${TESTS:-}"

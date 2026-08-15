@@ -122,7 +122,9 @@ paused = bool(g.get("paused")) or bool(g.get("blocked")) or bool(g.get("tripped"
     or (g.get("dispatch_allowed") is False)
 prefixes = [p for p in sys.argv[2].split(":") if p]
 quota = any(reason.startswith(p) for p in prefixes)
-print(f"{1 if paused else 0}\t{1 if quota else 0}\t{reason}\t{resume}")
+# reason goes LAST so a literal tab inside it can't shift fields —
+# `read -r a b c d` folds everything remaining into the final variable.
+print(f"{1 if paused else 0}\t{1 if quota else 0}\t{resume}\t{reason}")
 PY
 )
     if [ -z "$parsed" ]; then
@@ -130,7 +132,7 @@ PY
         return 0
     fi
     GATE_KNOWN=1
-    IFS=$'\t' read -r GATE_PAUSED GATE_QUOTA GATE_REASON GATE_RESUME_AT <<< "$parsed"
+    IFS=$'\t' read -r GATE_PAUSED GATE_QUOTA GATE_RESUME_AT GATE_REASON <<< "$parsed"
 }
 
 # Binary gate verdict for the dispatch loop (unchanged contract).
@@ -318,7 +320,7 @@ handle_quota_pause() {  # $1=reason $2=resume_at
                 log "canary dispatch issued board=$board (age=${age}s >= ${PAUSE_FAILSAFE_S}s — probing stale gate)"
                 alert "BOARD-PAUSE FAILSAFE: board=$board paused ${age}s >= 6h — forcing ONE canary claim to probe the gate; watch the canary task (T3.2)"
                 "$HERMES_BIN" kanban --board "$board" dispatch --max 1 \
-                    --failure-limit "$FAILURE_LIMIT" 2>&1 || \
+                    --failure-limit "$FAILURE_LIMIT" </dev/null 2>&1 || \
                     log "canary dispatch board=$board returned rc=$?"
                 ;;
         esac
