@@ -1,0 +1,53 @@
+--- /home/c03rad0r/.hermes/kanban/boards/hermes-for-friends/workspaces/t_faa7c86f/zai_proxy.snapshot.py	2026-08-15 17:14:55.260148821 +0530
++++ /home/c03rad0r/.hermes/kanban/boards/hermes-for-friends/workspaces/t_faa7c86f/zai_proxy.fixed.py	2026-08-15 17:15:48.973912448 +0530
+@@ -3882,16 +3882,26 @@
+ 
+                         # Non-empty response — send to client
+                         _mark_key_healthy(name)
+-                        self.send_response(resp.status)
+-                        for h, v in resp.headers.items():
+-                            if h.lower() not in ("transfer-encoding", "connection"):
+-                                self.send_header(h, v)
+-                        if is_truncated:
+-                            self.send_header("X-Response-Truncated", "true")
+-                        self.end_headers()
+-                        response_buffer.extend(full_body)
+-                        self.wfile.write(full_body)
+-                        self.wfile.flush()
++                        status_code = resp.status
++                        try:
++                            self.send_response(resp.status)
++                            for h, v in resp.headers.items():
++                                if h.lower() not in ("transfer-encoding", "connection"):
++                                    self.send_header(h, v)
++                            if is_truncated:
++                                self.send_header("X-Response-Truncated", "true")
++                            self.end_headers()
++                            response_buffer.extend(full_body)
++                            self.wfile.write(full_body)
++                            self.wfile.flush()
++                        except (BrokenPipeError, ConnectionResetError) as _ce:
++                            # Client vanished mid-stream — the upstream
++                            # succeeded, so the key stays healthy and must
++                            # NOT be marked failed (nor retried elsewhere).
++                            # Truthful api_calls row: upstream status + a
++                            # client-disconnect note instead of a fake 502.
++                            error_text = f"client disconnect: {_ce.__class__.__name__}"
++                            return
+                         # Success — reset the Kalman consecutive-429 streak.
+                         if _rate_limit_predictor is not None:
+                             _rate_limit_predictor.record_success()
+@@ -3928,7 +3938,12 @@
+                     if _is_retryable_error(e):
+                         if _attempt_retry(e, attempt, name, t0, order):
+                             continue
+-                    # Non-retryable error
++                    # Non-retryable error. A timeout / connection failure IS
++                    # an upstream server-side failure: mark the key so the
++                    # anomaly trail (and the recent_503 gate) sees the burst
++                    # class that previously surfaced only as client 502s with
++                    # zero anomaly rows (t_8e2673cd, 2026-08-15 read timeouts).
++                    _mark_key_server_error(name)
+                     status_code = 502
+                     error_text = f"proxy error: {e}"
+                     msg = f"proxy error: {e}".encode()
