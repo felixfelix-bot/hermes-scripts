@@ -364,9 +364,24 @@ else
 fi
 check_resources "pre-flight" || exit 0
 
+# Emergency stop: dispatch freeze marker blocks ALL dispatch (SOUL contract).
+if [ -f "$HOME/.hermes/bot/.dispatch_frozen" ]; then
+    log "dispatch FROZEN (.dispatch_frozen present) — skipping pass"
+    exit 0
+fi
+
 # Dispatch loop — one board per pass, re-check gate + resources before each spawn
 spawned=0
 for board in $BOARDS; do
+    # Circuit-breaker pre-spawn check (D3): exit 1 = HOLD (skip this board only).
+    # Any other rc — internal error (2+) or missing breaker (127) — fails OPEN
+    # per the circuit-breaker.sh contract: never wedge dispatch on our own bugs.
+    cb_rc=0
+    cb_msg=$(bash "$HOME/.hermes/scripts/circuit-breaker.sh" check "$board" 2>/dev/null) || cb_rc=$?
+    if [ "$cb_rc" -eq 1 ]; then
+        log "circuit breaker HOLD board=$board (${cb_msg:-frozen or tripped}) — skipping board"
+        continue
+    fi
     if ! check_gate; then
         # Gate tripped mid-pass: if quota-class, persist markers for ALL boards
         # so the pause is visible + fail-safe armed even if the next cron is missed.
