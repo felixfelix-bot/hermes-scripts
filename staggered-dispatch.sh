@@ -89,6 +89,7 @@ check_resources "pre-flight" || exit 0
 
 # Dispatch loop — one board per pass, re-check gate + resources before each spawn
 spawned=0
+bash "$HOME/.hermes/scripts/circuit-breaker.sh" check "$board" 2>/dev/null || continue
 for board in $BOARDS; do
     check_gate || break
     check_resources "$board" || break
