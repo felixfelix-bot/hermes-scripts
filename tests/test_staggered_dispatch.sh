@@ -316,10 +316,11 @@ t14_quota_window_and_kalman_reasons_are_quota_class() {
 t15_tab_in_reason_does_not_shift_fields() {
     # regression: gate reason containing a tab must not corrupt
     # GATE_REASON/GATE_RESUME_AT field parsing (reason is the LAST field).
-    # JSON source uses the escaped form 	 (raw control chars are invalid
-    # JSON); json.load decodes it to a real tab before the dispatcher sees it.
+    # The gate file must carry the escaped form backslash-t (a raw tab is
+    # invalid JSON); json.load decodes it to a real tab before the
+    # dispatcher sees it.
     new_env
-    write_gate true '"2026-08-15T12:00:00+00:00"' 'zai-503-outage: a	b'
+    write_gate true '"2026-08-15T12:00:00+00:00"' 'zai-503-outage: a\tb'
     local expected='zai-503-outage: a'$'	''b'
     run_dispatch
     assert_file_exists "$(marker_for alpha)" "t15: marker written despite tab in reason"
