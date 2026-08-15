@@ -432,11 +432,14 @@ def collect_503_events_journal(now):
             continue
         # short-unix format: 'ts host ident[pid]: message'. Match only the
         # MESSAGE text — the ident ('zai-proxy[503]') is where PID/counter
-        # false positives live.
+        # false positives live. A line without the 'ident[pid]: ' separator
+        # is malformed for this unit — skip it rather than risk matching
+        # the host/ident portion.
         msg = parts[1]
         bracket = msg.find("]: ")
-        if bracket != -1:
-            msg = msg[bracket + 3:]
+        if bracket == -1:
+            continue
+        msg = msg[bracket + 3:]
         if ts < cutoff or not _JOURNAL_503_RE.search(msg):
             continue
         if not _JOURNAL_ERROR_CTX_RE.search(msg):

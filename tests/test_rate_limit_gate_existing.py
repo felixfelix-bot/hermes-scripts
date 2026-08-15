@@ -249,11 +249,12 @@ class TestCollectorErrorPaths(unittest.TestCase):
         lines = ("1780000000.0 h zai-proxy[77]: upstream 503 error\n"
                  "1780000001.0 h zai-proxy[77]: 200 OK\n"
                  "1780000002.0 h zai-proxy[503]: request completed\n"
-                 "1780000003.0 h zai-proxy[77]: served 503 requests\n")
+                 "1780000003.0 h zai-proxy[77]: served 503 requests\n"
+                 "1780000004.0 h malformed no separator 503 error\n")
         proc = mock.Mock(returncode=0, stdout=lines)
         with mock.patch.object(gate.subprocess, "run", return_value=proc):
             events = gate.collect_503_events_journal(now=1780000500.0)
-        self.assertEqual(len(events), 1)  # PID-503 + counter lines must not count
+        self.assertEqual(len(events), 1)  # PID-503 + counter + malformed lines must not count
         self.assertEqual(events[0]["source"], "journal")
 
     def test_journal_rc0_zero_lines_warns_once(self):
