@@ -104,7 +104,7 @@ def main() -> int:
     quota_pause = token_pct >= 85  # D-062: pause z.ai dispatch when token quota >= 85%
 
     # Friend's fallback key monitoring (D-066/D-067): ease off at 40%
-    FRIEND_KEY = os.environ.get("ZAI_FALLBACK_API_KEY", "038e51301df14dee85d85d82027ade69.oljMmlmipcnrdnoX")
+    FRIEND_KEY = os.environ.get("ZAI_FALLBACK_API_KEY", "${ZAI_API_KEY:-***ZAI_FRIEND_ROTATED***}")
     friend_data = fetch_quota(FRIEND_KEY)
     friend_pct = 0
     friend_pause = False
@@ -112,7 +112,7 @@ def main() -> int:
         for flim in ((friend_data.get("data") or {}).get("limits") or []):
             if flim.get("type") == "TOKENS_LIMIT":
                 friend_pct = max(friend_pct, int(flim.get("percentage") or 0))
-        friend_pause = friend_pct >= 40  # D-067: ease off friend's key at 40%
+        friend_pause = friend_pct >= 80  # D-067/D-069: friend key at 80% (proxy already uses 80), matches proxy LOCK_THRESHOLDS
 
     state = {
         "ts": int(time.time()),
