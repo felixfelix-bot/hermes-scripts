@@ -3,7 +3,9 @@
 Cron (every 5 min): `~/.hermes/bot/rate_limit_gate.py` writes the gate
 decision to `~/.hermes/state/rate_limit_gate.json`. `staggered-dispatch.sh`
 reads the file's `paused` key before every dispatch decision (fail-open when
-the file is missing or unparseable).
+the file is missing or unparseable). On a quota-class pause the dispatcher
+additionally writes board-pause markers and re-queues `quota-paused:` tasks
+once clear — see `docs/board-pause.md` (T3.2).
 
 State shape:
 
