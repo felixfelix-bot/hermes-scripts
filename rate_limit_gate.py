@@ -2,13 +2,23 @@
 """
 Rate-limit gate for dispatch-level worker spawning control.
 
-Checks three conditions before allowing worker dispatch:
+Checks five conditions before allowing worker dispatch:
 1. Is current UTC hour a known rate-limit hour? (historical 429 frequency by hour)
 2. Any 429 in last 5 minutes? (active rate-limit burst)
 3. Kalman prediction: will quota exhaust during next task duration?
+4. recent_503: >=3 z.ai upstream 503/5xx within 10 min (anomaly_events
+   key_backoff/error_type=server rows, api_calls status_code=503 rows, or the
+   zai-proxy journald log) -> paused, reason zai-503-outage, resume_at =
+   now + min(Retry-After, 20 min). Fail-closed on confirmed burst; the pause
+   is re-evaluated on every 5-min cron run.
+5. quota_windows: any 5-hour/weekly/monthly window >=85% used (from the
+   localhost:9099 proxy /quota cache — same source the dq05 monitor reads)
+   -> advisory pause with resume_at = next window reset. Fail-open on
+   missing/stale data.
 
 Outputs JSON state to ~/.hermes/state/rate_limit_gate.json:
-  {paused: bool, resume_at: iso_ts|null, reason: str, ts: iso_ts}
+  {paused: bool, resume_at: iso_ts|null, reason: str, ts: iso_ts,
+   checked_at: iso_ts, checks: {...}}
 
 Exit code 0 = clear (dispatch OK), exit code 1 = paused (skip dispatch).
 
@@ -21,14 +31,20 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_DB = os.path.expanduser("~/.hermes/bot/zai_usage.db")
-STATE_PATH = os.path.expanduser("~/.hermes/state/rate_limit_gate.json")
+STATE_PATH = os.environ.get(
+    "HERMES_GATE_STATE",
+    os.path.expanduser("~/.hermes/state/rate_limit_gate.json"),
+)
 DEFAULT_DURATION = 300  # 5 min estimated task duration
 
 # --- Rate-limit hot hours (from historical analysis: peak 02-05 + 10-11 UTC) ---
@@ -41,6 +57,22 @@ RECENT_429_THRESHOLD = 1         # any 429 in window → pause
 PEAK_HOUR_429_RATIO = 0.15       # if current hour historically has >15% of all 429s → cautious
 KALMAN_EXHAUST_HOURS = 0.5       # if Kalman predicts exhaust in < 0.5h → pause
 MIN_SAMPLES_FOR_PEAK = 5         # need at least this many 429s in an hour to call it peak
+
+# --- T3.1: z.ai 503-outage awareness (fail-closed on confirmed burst) ---
+RECENT_503_WINDOW = 600          # 10 min
+RECENT_503_THRESHOLD = 3         # >=3 z.ai upstream 503/5xx in window → outage
+MAX_503_RESUME_S = 20 * 60       # resume_at = now + min(Retry-After, 20 min)
+
+# --- T3.1: quota-window awareness (advisory pause, fail-open on missing data) ---
+QUOTA_URL = os.environ.get("HERMES_GATE_QUOTA_URL", "http://localhost:9099/quota")
+QUOTA_HTTP_TIMEOUT = 4           # seconds; proxy is local
+QUOTA_WINDOW_PCT = 85.0          # any window >= this pct used → pause
+QUOTA_STALE_S = 1800             # /quota payload older than 30 min → treat as missing
+QUOTA_FALLBACK_RESUME_S = 1800   # window hot but resets_at unknown → re-check in 30 min
+
+PROXY_JOURNAL_UNIT = "zai-proxy.service"
+_BACKOFF_RE = re.compile(r"backoff (\d+)s")
+_JOURNAL_503_RE = re.compile(r"\b503\b")
 
 
 def utc_now():
@@ -142,15 +174,20 @@ def check_recent_429(conn):
         total = count + api_count
         triggered = total >= RECENT_429_THRESHOLD
 
-        # Estimate resume time from last retry_after_estimate if available
+        # Estimate resume time from last retry_after_estimate if available.
+        # (Defensive: older schemas have no retry_after_estimate column — a
+        # missing hint must never discard the already-computed trigger.)
         resume_offset = 60  # default 1 min backoff
         if last_ts:
-            recent = conn.execute("""
-                SELECT retry_after_estimate FROM rate_limit_samples
-                WHERE ts >= ? ORDER BY ts DESC LIMIT 1
-            """, (cutoff,)).fetchone()
-            if recent and recent["retry_after_estimate"] and recent["retry_after_estimate"] > 0:
-                resume_offset = recent["retry_after_estimate"]
+            try:
+                recent = conn.execute("""
+                    SELECT retry_after_estimate FROM rate_limit_samples
+                    WHERE ts >= ? ORDER BY ts DESC LIMIT 1
+                """, (cutoff,)).fetchone()
+                if recent and recent["retry_after_estimate"] and recent["retry_after_estimate"] > 0:
+                    resume_offset = recent["retry_after_estimate"]
+            except Exception:
+                pass
 
         return {
             "triggered": triggered,
@@ -242,73 +279,327 @@ def check_kalman(conn, task_duration_s):
         return {"triggered": False, "error": str(e), "resume_offset": 600, "reason": None, "windows": []}
 
 
+# --- T3.1: recent z.ai 503/5xx burst (pure decision helpers + collectors) ---
+
+def evaluate_recent_503(events, now):
+    """Pure: decide whether a set of observed 503/5xx events is a burst.
+
+    events: list of {ts: unix float, source: str, retry_after_s: float|None}.
+    Triggers on >= RECENT_503_THRESHOLD events inside RECENT_503_WINDOW.
+    resume_offset = min(max retry hint, MAX_503_RESUME_S); defaults to the
+    20-min cap when no Retry-After hint is available.
+    """
+    recent = [e for e in events if now - e["ts"] <= RECENT_503_WINDOW]
+    triggered = len(recent) >= RECENT_503_THRESHOLD
+    result = {
+        "triggered": triggered,
+        "count": len(recent),
+        "resume_offset": MAX_503_RESUME_S,
+        "reason": None,
+        "fail_open": len(events) == 0,
+    }
+    if triggered:
+        hints = [e.get("retry_after_s") for e in recent if e.get("retry_after_s")]
+        if hints:
+            result["resume_offset"] = min(max(hints), MAX_503_RESUME_S)
+        result["reason"] = (
+            f"zai-503-outage: {len(recent)} upstream 503/5xx in last "
+            f"{RECENT_503_WINDOW}s"
+        )
+    return result
+
+
+def pick_503_decision(results):
+    """Pure: pick the per-source result with the highest confirmed count.
+
+    results: list of evaluate_recent_503 outputs (one per source), each
+    annotated with "source". Sources observe the same underlying failures,
+    so the max (not the sum) is the conservative confirmed count.
+    """
+    triggered = [r for r in results if r.get("triggered")]
+    if triggered:
+        return max(triggered, key=lambda r: r.get("count", 0))
+    counts = [r.get("count", 0) for r in results] or [0]
+    return {
+        "triggered": False,
+        "count": max(counts),
+        "resume_offset": MAX_503_RESUME_S,
+        "reason": None,
+        "fail_open": not results,
+    }
+
+
+def collect_503_events_anomaly(conn, now):
+    """Collect upstream server-error events from anomaly_events.
+
+    The proxy records every upstream 500/502/503/504 as a key_backoff WARN
+    anomaly with 'error_type=server' in the detail, including its own
+    backoff hint ('backoff Ns'). Missing table → [] (fail-open).
+    """
+    try:
+        rows = conn.execute(
+            """SELECT ts, detail FROM anomaly_events
+               WHERE category = 'key_backoff'
+                 AND detail LIKE '%error_type=server%'
+                 AND ts >= ?
+               ORDER BY ts""",
+            (now - RECENT_503_WINDOW,),
+        ).fetchall()
+    except Exception:
+        return []
+    events = []
+    for r in rows:
+        hint = None
+        if r["detail"]:
+            m = _BACKOFF_RE.search(r["detail"])
+            if m:
+                hint = float(m.group(1))
+        events.append({"ts": r["ts"], "source": "anomaly", "retry_after_s": hint})
+    return events
+
+
+def collect_503_events_api(conn, now):
+    """Collect 503 rows from api_calls (if the proxy starts logging them)."""
+    try:
+        rows = conn.execute(
+            """SELECT ts FROM api_calls
+               WHERE status_code = 503 AND ts >= ?
+               ORDER BY ts""",
+            (now - RECENT_503_WINDOW,),
+        ).fetchall()
+    except Exception:
+        return []
+    return [{"ts": r["ts"], "source": "api_calls", "retry_after_s": None}
+            for r in rows]
+
+
+def collect_503_events_journal(now):
+    """Best-effort: count 503 lines in the zai-proxy journald log.
+
+    The proxy's stdout/stderr go to journald. Unreadable journal (common for
+    unprivileged cron) → [] — the DB sources above are the primary signal.
+    """
+    try:
+        proc = subprocess.run(
+            ["journalctl", "-u", PROXY_JOURNAL_UNIT, "--no-pager", "-q",
+             "-o", "short-unix", "--since", f"-{RECENT_503_WINDOW // 60} min"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if proc.returncode != 0:
+            return []
+    except Exception:
+        return []
+    cutoff = now - RECENT_503_WINDOW
+    events = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            ts = float(parts[0])
+        except ValueError:
+            continue
+        if ts < cutoff or not _JOURNAL_503_RE.search(parts[1]):
+            continue
+        events.append({"ts": ts, "source": "journal", "retry_after_s": None})
+    return events
+
+
+# --- T3.1: quota-window awareness (pure helpers + collector) ---
+
+def parse_quota_payload(payload, now):
+    """Pure: extract per-key windows from the proxy /quota payload.
+
+    Skips sections that are not dicts with a 'windows' list (e.g. 'active',
+    'ollama_cloud', 'proactive_cooldown') and keys whose data is stale
+    (age_s > QUOTA_STALE_S). Malformed payload → [] (fail-open).
+    """
+    if not isinstance(payload, dict):
+        return []
+    windows = []
+    for key, section in payload.items():
+        if not isinstance(section, dict):
+            continue
+        age = section.get("age_s")
+        if isinstance(age, (int, float)) and age > QUOTA_STALE_S:
+            continue
+        raw = section.get("windows")
+        if not isinstance(raw, list):
+            continue
+        for w in raw:
+            if not isinstance(w, dict):
+                continue
+            used = w.get("used_pct")
+            if not isinstance(used, (int, float)):
+                continue
+            resets = w.get("resets_at")
+            if not isinstance(resets, (int, float)):
+                resets = None
+            windows.append({
+                "key": key,
+                "name": str(w.get("name", "unknown")),
+                "used_pct": float(used),
+                "resets_at": resets,
+            })
+    return windows
+
+
+def evaluate_quota_windows(windows, now):
+    """Pure: pause if any quota window is >= QUOTA_WINDOW_PCT used.
+
+    resume_at = the hot window's resets_at; when resets_at is unknown, fall
+    back to a 30-min re-check offset instead of pausing forever. Windows
+    whose resets_at already passed are ignored (stale sample, next cron run
+    refreshes the data).
+    """
+    result = {
+        "triggered": False,
+        "window": None,
+        "key": None,
+        "used_pct": None,
+        "resume_at_ts": None,
+        "fallback_resume": False,
+        "reason": None,
+        "fail_open": len(windows) == 0,
+    }
+    candidates = []
+    for w in windows:
+        if w["used_pct"] < QUOTA_WINDOW_PCT:
+            continue
+        if w["resets_at"] is not None and w["resets_at"] <= now:
+            continue
+        candidates.append(w)
+    if not candidates:
+        return result
+    worst = max(candidates, key=lambda w: w["used_pct"])
+    result["triggered"] = True
+    result["window"] = worst["name"]
+    result["key"] = worst["key"]
+    result["used_pct"] = worst["used_pct"]
+    if worst["resets_at"] is None:
+        result["resume_at_ts"] = now + QUOTA_FALLBACK_RESUME_S
+        result["fallback_resume"] = True
+    else:
+        result["resume_at_ts"] = worst["resets_at"]
+    result["reason"] = (
+        f"QUOTA-WINDOW: {worst['key']} {worst['name']} window at "
+        f"{worst['used_pct']:.1f}% (>= {QUOTA_WINDOW_PCT:.0f}% threshold) — "
+        f"advisory pause until window reset"
+    )
+    return result
+
+
+def fetch_quota_payload():
+    """GET the proxy /quota cache. Returns the parsed dict or None (fail-open)."""
+    try:
+        with urllib.request.urlopen(QUOTA_URL, timeout=QUOTA_HTTP_TIMEOUT) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+# --- Decision (priority: 503 outage > active 429 > quota window > Kalman > peak) ---
+
+def decide(now, recent_503, recent_429, quota, kalman, peak):
+    """Pure: combine check results into the gate decision."""
+    if recent_503.get("triggered"):
+        return (True,
+                f"503-OUTAGE: {recent_503.get('reason')}",
+                iso(now + recent_503.get("resume_offset", MAX_503_RESUME_S)))
+    if recent_429.get("triggered"):
+        return (True,
+                f"ACTIVE 429: {recent_429.get('reason')}",
+                iso(now + recent_429.get("resume_offset", 60)))
+    if quota.get("triggered"):
+        return (True,
+                quota.get("reason") or "QUOTA-WINDOW: window >= threshold",
+                iso(quota.get("resume_at_ts", now + QUOTA_FALLBACK_RESUME_S)))
+    if kalman.get("triggered"):
+        return (True,
+                f"KALMAN: {kalman.get('reason')}",
+                iso(now + kalman.get("resume_offset", 600)))
+    if peak.get("is_peak"):
+        return (False,
+                f"ADVISORY: {peak.get('reason')} — dispatch with caution",
+                None)
+    return (False, "clear", None)
+
+
 def run_gate(db_path=DEFAULT_DB, task_duration=DEFAULT_DURATION, verbose=False):
-    """Run all three checks and produce the gate decision."""
+    """Run all five checks and produce the gate decision."""
     now = time.time()
     conn = connect(db_path)
 
-    # If no DB, default to clear (don't block dispatch on missing data)
+    # --- T3.1 checks run even without the DB (journal + proxy /quota) ---
+    per_source = []
+    journal_events = collect_503_events_journal(now)
+    per_source.append(("journal", evaluate_recent_503(journal_events, now)))
+
     if conn is None:
-        result = {
-            "paused": False,
-            "resume_at": None,
-            "reason": "DB not found — gate defaults to clear",
-            "ts": iso(now),
-            "checks": {},
-        }
-        return result
+        peak = {"is_peak": False, "reason": None, "error": "DB not found"}
+        recent = {"triggered": False, "resume_offset": 60, "reason": None,
+                  "error": "DB not found"}
+        kalman = {"triggered": False, "reason": None, "windows": [],
+                  "error": "DB not found"}
+    else:
+        try:
+            per_source.insert(0, ("anomaly", evaluate_recent_503(
+                collect_503_events_anomaly(conn, now), now)))
+            per_source.insert(1, ("api_calls", evaluate_recent_503(
+                collect_503_events_api(conn, now), now)))
+            peak = check_peak_hour(conn)
+            recent = check_recent_429(conn)
+            kalman = check_kalman(conn, task_duration)
+        finally:
+            conn.close()
 
-    try:
-        peak = check_peak_hour(conn)
-        recent = check_recent_429(conn)
-        kalman = check_kalman(conn, task_duration)
+    annotated = []
+    for source, res in per_source:
+        res = dict(res)
+        res["source"] = source
+        annotated.append(res)
+    burst = pick_503_decision(annotated)
 
-        # Decision logic — priority: active 429 > Kalman exhaustion > peak hour (advisory only)
-        paused = False
-        reason = "clear"
-        resume_at = None
+    quota_payload = fetch_quota_payload()
+    if quota_payload is None:
+        quota = {"triggered": False, "reason": None, "fail_open": True,
+                 "error": f"quota collector unreachable at {QUOTA_URL}"}
+    else:
+        quota = evaluate_quota_windows(parse_quota_payload(quota_payload, now), now)
 
-        if recent["triggered"]:
-            paused = True
-            resume_ts = now + recent["resume_offset"]
-            resume_at = iso(resume_ts)
-            reason = f"ACTIVE 429: {recent['reason']}"
-        elif kalman["triggered"]:
-            paused = True
-            resume_ts = now + kalman["resume_offset"]
-            resume_at = iso(resume_ts)
-            reason = f"KALMAN: {kalman['reason']}"
-        elif peak["is_peak"]:
-            # Peak hour is advisory only — don't hard pause, just note it
-            # Unless combined with elevated recent activity (even below threshold)
-            reason = f"ADVISORY: {peak['reason']} — dispatch with caution"
-            paused = False
+    paused, reason, resume_at = decide(now, burst, recent, quota, kalman, peak)
 
-        result = {
-            "paused": paused,
-            "resume_at": resume_at,
-            "reason": reason,
-            "ts": iso(now),
-            "checks": {
-                "peak_hour": peak,
-                "recent_429": {k: v for k, v in recent.items() if k != "reason"},
-                "kalman": {k: v for k, v in kalman.items() if k != "reason"},
-            },
-        }
+    if not paused and conn is None:
+        reason = "DB not found — gate defaults to clear"
 
-        if verbose:
-            result["checks"]["recent_429"]["reason"] = recent.get("reason")
-            result["checks"]["kalman"]["reason"] = kalman.get("reason")
+    result = {
+        "paused": paused,
+        "resume_at": resume_at,
+        "reason": reason,
+        "ts": iso(now),
+        "checked_at": iso(now),
+        "checks": {
+            "peak_hour": peak,
+            "recent_429": {k: v for k, v in recent.items() if k != "reason"},
+            "kalman": {k: v for k, v in kalman.items() if k != "reason"},
+            "recent_503": {k: v for k, v in burst.items() if k != "reason"},
+            "quota_windows": quota,
+        },
+    }
 
-        return result
-    finally:
-        conn.close()
+    if verbose:
+        result["checks"]["recent_429"]["reason"] = recent.get("reason")
+        result["checks"]["kalman"]["reason"] = kalman.get("reason")
+        result["checks"]["recent_503"]["reason"] = burst.get("reason")
+
+    return result
 
 
 def write_state(result):
-    """Write gate decision to state file."""
-    Path(STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with open(STATE_PATH, "w") as f:
+    """Write gate decision to state file (HERMES_GATE_STATE overrides path)."""
+    state_path = os.environ.get("HERMES_GATE_STATE", STATE_PATH)
+    Path(state_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(state_path, "w") as f:
         json.dump(result, f, indent=2, default=str)
 
 
