@@ -73,7 +73,11 @@ QUOTA_FALLBACK_RESUME_S = 1800   # window hot but resets_at unknown → re-check
 PROXY_JOURNAL_UNIT = "zai-proxy.service"
 _BACKOFF_RE = re.compile(r"backoff (\d+(?:\.\d+)?)s")
 _JOURNAL_503_RE = re.compile(r"\b503\b")
-_JOURNAL_ERROR_CTX_RE = re.compile(r"error|exhaust|fail|upstream|proxy", re.I)
+# Error-context tokens for journal lines. NOTE: 'proxy' is deliberately NOT
+# in this alternation — the syslog ident ('zai-proxy[pid]') contains it, and
+# matching the raw line would let every line from this unit pass the filter.
+# Both regexes are applied to the MESSAGE text only (after 'ident[pid]: ').
+_JOURNAL_ERROR_CTX_RE = re.compile(r"error|exhaust|fail|upstream|timeout", re.I)
 
 
 def utc_now():
@@ -368,15 +372,18 @@ def collect_503_events_api(conn, now):
     generic-exception failures, which the proxy returns to clients as 502
     'proxy error: ...'. External failover attempts log their own rows with
     tier=<provider_name>; a failing external provider while z.ai is healthy
-    is NOT a z.ai outage, so those rows are excluded. NULL tier (legacy
-    pre-RP-1 rows) stays visible — in that era only the zai path wrote
-    5xx rows at all.
+    is NOT a z.ai outage, so those rows are excluded. Missing tier (NULL or
+    empty string — legacy pre-RP-1 rows or writer anomalies) stays visible —
+    in that era only the zai path wrote 5xx rows at all. The query failing
+    (e.g. schema without the tier column) fails open to [] like every DB
+    collector here; the journal source's stderr WARN is the observability
+    pattern for dead sources.
     """
     try:
         rows = conn.execute(
             """SELECT ts FROM api_calls
                WHERE status_code IN (502, 503, 504)
-                 AND (tier = 'zai' OR tier IS NULL)
+                 AND (tier = 'zai' OR tier IS NULL OR tier = '')
                  AND ts >= ?
                ORDER BY ts""",
             (now - RECENT_503_WINDOW,),
@@ -402,13 +409,15 @@ def collect_503_events_journal(now):
         if proc.returncode != 0:
             return []
         if not proc.stdout.strip():
-            # rc=0 with zero lines usually means journal-permission death
-            # under the cron user (t_faa7c86f finding 2): the source is
-            # dead, not the proxy quiet. Surface it once per run on stderr
-            # so cron output shows the journal source is not contributing.
+            # rc=0 with zero lines: either journal-permission death under the
+            # cron user (t_faa7c86f finding 2) or a genuinely quiet window.
+            # Either way the journal source contributes nothing this run —
+            # say so once on stderr so cron output shows which sources are
+            # live; the DB sources remain primary.
             print(f"WARN: journalctl -u {PROXY_JOURNAL_UNIT} returned 0 "
-                  f"lines (journal perms?) — journal 503 source dead this "
-                  f"run; relying on DB sources", file=sys.stderr)
+                  f"lines (journal perms or quiet window) — journal 503 "
+                  f"source contributed nothing this run; relying on DB "
+                  f"sources", file=sys.stderr)
     except Exception:
         return []
     cutoff = now - RECENT_503_WINDOW
@@ -421,9 +430,16 @@ def collect_503_events_journal(now):
             ts = float(parts[0])
         except ValueError:
             continue
-        if ts < cutoff or not _JOURNAL_503_RE.search(parts[1]):
+        # short-unix format: 'ts host ident[pid]: message'. Match only the
+        # MESSAGE text — the ident ('zai-proxy[503]') is where PID/counter
+        # false positives live.
+        msg = parts[1]
+        bracket = msg.find("]: ")
+        if bracket != -1:
+            msg = msg[bracket + 3:]
+        if ts < cutoff or not _JOURNAL_503_RE.search(msg):
             continue
-        if not _JOURNAL_ERROR_CTX_RE.search(parts[1]):
+        if not _JOURNAL_ERROR_CTX_RE.search(msg):
             continue  # bare '503' in a PID/counter is not an outage signal
         events.append({"ts": ts, "source": "journal", "retry_after_s": None})
     return events

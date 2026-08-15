@@ -41,9 +41,13 @@ Exit codes: 0 = clear, 1 = paused.
      attempts (`tier = <provider>`) are excluded; NULL tier (legacy rows)
      is included.
    - `journalctl -u zai-proxy.service` (best-effort; unreadable journal →
-     skipped, fail-open — the DB sources are primary). When journalctl
+     skipped, fail-open — the DB sources are primary). Lines are matched on
+     the MESSAGE text only (after the `ident[pid]: ` prefix) so a PID of
+     503 or the `zai-proxy` tag itself can never satisfy the filters; a
+     line needs `\b503\b` plus an error-context token. When journalctl
      returns rc=0 with zero lines (journal-perm death under the cron
-     user), one stderr WARN per run names the dead source.
+     user, or a quiet window), one stderr WARN per run names the
+     non-contributing source.
 2. **recent_429** — any 429 in the last 5 min → paused ~60 s (longer when a
    retry hint exists).
 3. **quota_windows** (T3.1, advisory pause, fail-open) — any 5-hour /
