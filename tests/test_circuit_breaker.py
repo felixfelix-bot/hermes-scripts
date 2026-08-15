@@ -284,7 +284,10 @@ def test_streak_takes_max_of_column_and_runs(tmp_path):
 
 # ── Unit: config precedence ──────────────────────────────────────────────────
 
-def test_config_defaults():
+def test_config_defaults(tmp_path, monkeypatch):
+    # isolate from the host's real config file (e.g. a live enforce-mode
+    # ~/.hermes/config/circuit-breaker.json must not flip these assertions)
+    monkeypatch.setenv("CIRCUIT_BREAKER_CONFIG", str(tmp_path / "absent-cb.json"))
     cfg = cb.load_config({})
     assert cfg["mode"] == "log-only"
     assert cfg["task_threshold"] == 3

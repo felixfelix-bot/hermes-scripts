@@ -168,7 +168,7 @@ def test_dry_run_default_makes_no_changes(db, tmp_path, capsys):
     rc = rs.main(["--db", str(db), "--cutoff", CUTOFF])
     assert rc == 0
     assert get_session(db, "stale_sess") == (None, None)  # untouched
-    assert list(tmp_path.glob("**/reap_snapshot*.json")) == []  # no snapshot
+    assert not any(tmp_path.rglob("*.json"))  # no snapshot written anywhere
     out = capsys.readouterr().out
     assert "stale_sess" in out and "DRY-RUN" in out
 
