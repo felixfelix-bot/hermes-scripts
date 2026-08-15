@@ -206,12 +206,29 @@ class TestCollectorErrorPaths(unittest.TestCase):
             self.assertEqual(gate.collect_503_events_journal(NOW), [])
 
     def test_journal_lines_parsed(self):
-        lines = "1780000000.0 h p[1]: upstream 503 error\n1780000001.0 h p[1]: 200 OK\n"
+        lines = ("1780000000.0 h p[1]: upstream 503 error\n"
+                 "1780000001.0 h p[1]: 200 OK\n"
+                 "1780000002.0 h p[503]: request completed\n")
         proc = mock.Mock(returncode=0, stdout=lines)
         with mock.patch.object(gate.subprocess, "run", return_value=proc):
             events = gate.collect_503_events_journal(now=1780000500.0)
-        self.assertEqual(len(events), 1)
+        self.assertEqual(len(events), 1)  # PID-503 line must not count
         self.assertEqual(events[0]["source"], "journal")
+
+    def test_float_backoff_hint_parsed(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE anomaly_events (id INTEGER PRIMARY KEY,"
+                     " ts REAL, severity TEXT, category TEXT, title TEXT,"
+                     " detail TEXT)")
+        conn.execute(
+            "INSERT INTO anomaly_events (ts, severity, category, title, detail)"
+            " VALUES (?,?,?,?,?)",
+            (time.time(), "WARN", "key_backoff", "ours server failure #1",
+             "backoff 12.5s; error_type=server"))
+        events = gate.collect_503_events_anomaly(conn, now=time.time())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["retry_after_s"], 12.5)
 
     def test_fetch_quota_unreachable_returns_none(self):
         with mock.patch.object(gate.urllib.request, "urlopen",

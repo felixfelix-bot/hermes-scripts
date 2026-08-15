@@ -26,7 +26,8 @@ Exit codes: 0 = clear, 1 = paused.
 ## Checks (decision priority, first match wins)
 
 1. **recent_503** (T3.1, fail-closed) — ≥3 z.ai upstream 503/5xx within
-   10 min → `paused=true`, reason `zai-503-outage`,
+   10 min → `paused=true`, top-level reason `zai-503-outage: ...` (the
+   `zai-*` prefix is a contract — T3.2/T3.3 match on it),
    `resume_at = now + min(Retry-After, 20 min)`. Re-evaluated every run, so
    the pause naturally lifts once the burst ages out of the window.
    Sources (max confirmed count across sources, never summed):

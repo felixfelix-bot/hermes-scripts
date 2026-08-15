@@ -274,7 +274,8 @@ class TestParseQuotaPayload(unittest.TestCase):
 class TestDecisionPriority(unittest.TestCase):
     def test_503_beats_429_and_quota(self):
         r503 = {"triggered": True, "resume_offset": 1200,
-                "reason": "zai-503-outage", "count": 3}
+                "reason": "zai-503-outage: 3 upstream 503/5xx in last 600s",
+                "count": 3}
         r429 = {"triggered": True, "resume_offset": 60, "reason": "ACTIVE 429"}
         quota = {"triggered": True, "resume_at_ts": NOW + 3600,
                  "reason": "QUOTA-WINDOW", "window": "5-hour"}
@@ -283,6 +284,8 @@ class TestDecisionPriority(unittest.TestCase):
             kalman={"triggered": False}, peak={"is_peak": True})
         self.assertTrue(paused)
         self.assertIn("zai-503-outage", reason)
+        # T3.2/T3.3 match on a top-level 'zai-*' reason prefix
+        self.assertTrue(reason.startswith("zai-"))
         self.assertEqual(resume_at, gate.iso(NOW + 1200))
 
     def test_quota_beats_kalman(self):

@@ -71,8 +71,9 @@ QUOTA_STALE_S = 1800             # /quota payload older than 30 min → treat as
 QUOTA_FALLBACK_RESUME_S = 1800   # window hot but resets_at unknown → re-check in 30 min
 
 PROXY_JOURNAL_UNIT = "zai-proxy.service"
-_BACKOFF_RE = re.compile(r"backoff (\d+)s")
+_BACKOFF_RE = re.compile(r"backoff (\d+(?:\.\d+)?)s")
 _JOURNAL_503_RE = re.compile(r"\b503\b")
+_JOURNAL_ERROR_CTX_RE = re.compile(r"error|exhaust|fail|upstream|proxy", re.I)
 
 
 def utc_now():
@@ -401,6 +402,8 @@ def collect_503_events_journal(now):
             continue
         if ts < cutoff or not _JOURNAL_503_RE.search(parts[1]):
             continue
+        if not _JOURNAL_ERROR_CTX_RE.search(parts[1]):
+            continue  # bare '503' in a PID/counter is not an outage signal
         events.append({"ts": ts, "source": "journal", "retry_after_s": None})
     return events
 
@@ -501,10 +504,15 @@ def fetch_quota_payload():
 # --- Decision (priority: 503 outage > active 429 > quota window > Kalman > peak) ---
 
 def decide(now, recent_503, recent_429, quota, kalman, peak):
-    """Pure: combine check results into the gate decision."""
+    """Pure: combine check results into the gate decision.
+
+    The 503-outage reason must keep its 'zai-*' prefix at the TOP level:
+    T3.2 (dispatcher pause semantics) and T3.3 (worker taxonomy) match on
+    that prefix, so no decorative prefix may be prepended here.
+    """
     if recent_503.get("triggered"):
         return (True,
-                f"503-OUTAGE: {recent_503.get('reason')}",
+                recent_503.get("reason") or "zai-503-outage",
                 iso(now + recent_503.get("resume_offset", MAX_503_RESUME_S)))
     if recent_429.get("triggered"):
         return (True,
