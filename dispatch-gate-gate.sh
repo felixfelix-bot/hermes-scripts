@@ -1,0 +1,1 @@
+/home/c03rad0r/.hermes/scripts/safe-single-dispatch.sh

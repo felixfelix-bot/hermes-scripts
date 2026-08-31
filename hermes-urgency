@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec /usr/bin/python3 /home/c03rad0r/.hermes/scripts/urgency_gate.py "$@"

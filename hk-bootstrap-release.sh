@@ -104,7 +104,10 @@ case "$DECISION" in
   *) exit 0 ;;   # HOLD or gate-error -> silent
 esac
 
-# --- Gates pass. Release HK-1 once. ---
+# --- Gates pass. Status-driven chain release. Board state = truth. ---
+# Order follows task_links: HK-1 head; HK-2/HK-3/HK-6 after HK-1;
+# HK-4 after HK-2 AND HK-3; HK-5 after HK-4. Idempotent — a task in
+# ready/running/done is skipped; CLI-transient failures retry next tick.
 st() { python3 -c "import json;print(json.load(open('$STATE')).get('$1',''))" 2>/dev/null; }
 setst() { python3 - "$1" "$2" "$STATE" <<'PYEOF'
 import json, os, sys
@@ -118,38 +121,82 @@ json.dump(d, open(tmp, 'w')); os.replace(tmp, p)
 PYEOF
 }
 
-if [ "$(st hk1_released)" = "1" ]; then
-    dbg "already released: silent"
+# Superseded by HK-3's permanent watchdog — silent forever.
+if [ "$(st superseded)" = "1" ]; then
+    dbg "superseded: silent"
     exit 0
 fi
 
-HK1_STATUS=$("$HERMES" kanban --board "$BOARD" list --json 2>/dev/null | python3 -c "
+task_status() {
+    "$HERMES" kanban --board "$BOARD" list --json 2>/dev/null | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 tasks = d if isinstance(d, list) else d.get('tasks', [])
 for t in tasks:
-    if t.get('id') == 't_b614c748':
+    if t.get('id') == '$1':
         print(t.get('status', '')); break
-" 2>/dev/null) || HK1_STATUS="error"
+" 2>/dev/null
+}
 
-dbg "HK-1 status: $HK1_STATUS"
+HK1=t_b614c748; HK2=t_bb3d7343; HK3=t_516327d5; HK4=t_2b4369c3; HK5=t_cea9ca72; HK6=t_b58a9b63
 
-case "$HK1_STATUS" in
-  scheduled|blocked)
-    if "$HERMES" kanban --board "$BOARD" unblock t_b614c748 --reason 'bootstrap: quota gates passed (weekly<60/5h<40 both keys) — releasing HK-1 creator helper; HK-3 permanent watchdog supersedes this shim' >/dev/null 2>&1; then
-        setst hk1_released 1
-        echo "HOUSEKEEPING BOOTSTRAP: quota cheap ($DECISION). Released HK-1 creator helper (t_b614c748) on board house-keeping. Chain: HK-1 done → HK-2+HK-3 release as parents complete → HK-4 pilots → HK-5 docs. HK-3 builds the permanent release watchdog which replaces this shim."
-    else
-        dbg "unblock failed: silent (retry next tick)"
+is_done() { case "$1" in done|completed|archived) return 0;; *) return 1;; esac; }
+
+MSG=""
+release_if_scheduled() {  # <id> <phase-note>
+    local ts; ts=$(task_status "$1")
+    case "$ts" in
+      scheduled|blocked)
+        if "$HERMES" kanban --board "$BOARD" unblock "$1" --reason "bootstrap $2: quota gates passed ($DECISION)" >/dev/null 2>&1; then
+            MSG="$MSG $1"
+            return 0
+        fi
+        ;;
+    esac
+    return 1
+}
+
+S1=$(task_status "$HK1")
+if is_done "$S1"; then
+    # PHASE 2: head done — release its direct dependents + independent HK-6.
+    release_if_scheduled "$HK2" 'phase 2' || true
+    release_if_scheduled "$HK3" 'phase 2' || true
+    release_if_scheduled "$HK6" 'phase 2' || true
+    # HK-4 requires BOTH HK-2 and HK-3 done (task_links).
+    if is_done "$(task_status "$HK2")" && is_done "$(task_status "$HK3")"; then
+        release_if_scheduled "$HK4" 'phase 2b' || true
     fi
-    ;;
-  done|archived|ready|running|review|in_progress|error)
-    # Chain already moving or HK-1 completed — mark released, stay silent.
-    setst hk1_released 1
-    dbg "HK-1 state $HK1_STATUS: mark released, silent"
-    ;;
-  *)
-    dbg "HK-1 unknown state '$HK1_STATUS': silent"
-    ;;
-esac
+    # HK-5 requires HK-4 done.
+    if is_done "$(task_status "$HK4")"; then
+        release_if_scheduled "$HK5" 'phase 2c' || true
+    fi
+else
+    # PHASE 1: chain head only.
+    release_if_scheduled "$HK1" 'phase 1' || dbg "HK-1 not releasable yet (state: $S1)"
+fi
+
+# PHASE 3: HK-3 done — its permanent watchdog exists. Self-remove.
+if is_done "$(task_status "$HK3")"; then
+    setst superseded 1
+    SELF_ID=$(python3 -c "
+import json
+for path in ('$HOME/.hermes/profiles/manager/cron/jobs.json', '$HOME/.hermes/cron/jobs.json'):
+    try:
+        d = json.load(open(path))
+    except Exception:
+        continue
+    jobs = d.get('jobs', d) if isinstance(d, dict) else d
+    for j in jobs:
+        if j.get('name') == 'hk-bootstrap-release':
+            print(j.get('id', '')); raise SystemExit(0)
+" 2>/dev/null)
+    if [ -n "${SELF_ID:-}" ]; then
+        "$HERMES" cron remove "$SELF_ID" >/dev/null 2>&1 && dbg "cron self-removed ($SELF_ID)"
+    fi
+    MSG="${MSG:+$MSG }[shim superseded by HK-3 watchdog, cron self-removed]"
+fi
+
+if [ -n "$MSG" ]; then
+    echo "HOUSEKEEPING BOOTSTRAP: quota cheap ($DECISION). Released:$MSG. Board house-keeping chain self-driving from here."
+fi
 exit 0
