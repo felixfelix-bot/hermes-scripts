@@ -35,14 +35,19 @@ STATE / LEDGER (MANDATORY-HARDENED, consultant v3):
   restarts. Per review task id it records:
       {task_id: {"last_alerted": <epoch>, "reassign_count": <int>}}
   reassign_count is the "reviewer-generation" used for dedup against the 4h
-  merge-queue digest: both watchdog and digest may observe the same breach, but
-  the dedup key (task_id, reassign_count) lets exactly one actor propose a given
-  generation's reassignment. Cross-process persistence means decisions are made
-  against durable state, never in-memory-only process state.
+  merge-queue digest: both the watchdog and the digest read/write the SAME
+  shared ledger file, so the dedup key (task_id, reassign_count) lets exactly
+  one actor propose a given generation's reassignment. Cross-process
+  persistence means decisions are made against durable state, never
+  in-memory-only process state. (The digest must read this same state file
+  and skip a task whose reassign_count it already acted on.)
 
   Reassignment is capped at --max-reassign per task (default 1). After that the
   task is routed to the MANAGER queue instead (no kimi<->glm ping-pong). Under
   --halt-file the watchdog never reassigns — it logs HALT and routes to manager.
+  Manager-routed alerts (HALT / budget-exhausted) do NOT consume the politeness
+  window or the reassign budget, so a still-stale task is reconsidered the
+  moment HALT lifts or reassign is re-enabled.
 """
 import argparse
 import json
@@ -105,10 +110,12 @@ def scan(db_path: str, at: float, sla_hours: int = 4,
     q = (
         "SELECT id, title, assignee, status, started_at FROM tasks WHERE status = 'running' OR status = 'review'"
     )
-    try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except Exception:
-        con = sqlite3.connect(db_path)
+    # Read-only guarantee (contract 1): the watchdog must NEVER open the board
+    # DB with write access. If the read-only URI connect fails, that is a hard
+    # error — we do NOT fall back to a read-write connection (which could
+    # create an empty DB or open the board writable). The caller (main) already
+    # guards that the path exists.
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = con.execute(q).fetchall()
     finally:
@@ -322,8 +329,14 @@ def main(argv=None) -> int:
                     if not isinstance(rec, dict):
                         rec = {}  # type: ignore[assignment]
                         new_state[a.task_id] = rec
-                    rec["last_alerted"] = at
+                    # Only a REASSIGN proposal consumes the politeness window
+                    # and the reassign budget. Manager-routed alerts (HALT or
+                    # budget exhausted) do NOT update last_alerted, so a
+                    # still-stale task is reconsidered on the next tick the
+                    # moment HALT lifts or the operator re-enables reassign —
+                    # no 6h politeness stall after an operator override.
                     if a.decision == "reassign":
+                        rec["last_alerted"] = at
                         rec["reassign_count"] = rec.get("reassign_count", 0) + 1
                     # HALT / manager-routed alerts do NOT consume the budget.
                 write_state(state_path, new_state)

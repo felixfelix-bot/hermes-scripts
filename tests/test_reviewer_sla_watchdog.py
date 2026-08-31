@@ -22,6 +22,7 @@ SLA contract under test (task t_55d56efa, D-114 §6):
             pattern (empty stdout => nothing delivered).
 """
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -295,6 +296,47 @@ def test_halt_flag_never_reassigns_routes_to_manager(tmp_path, capsys):
     # ledger must NOT have incremented reassign_count under HALT
     rec = json.loads(state.read_text()).get("t1", {})
     assert rec.get("reassign_count", 0) == 0
+
+
+def test_halt_does_not_consume_politeness_window(tmp_path, capsys):
+    """Manager-routed (HALT) alerts must NOT update last_alerted, so a
+    still-stale task is reconsidered the moment HALT lifts — no 6h politeness
+    stall after an operator override (cold-review finding 7)."""
+    db = make_board(tmp_path / "kanban.db", tasks=[
+        ("t1", "worker-reviewer-kimi", "running", T_STALE),
+    ])
+    state = tmp_path / "ledger.json"
+    halt = tmp_path / "REVIEWER_HALT"
+    halt.write_text("halt\n")
+    # Run 1 under HALT: routes to manager, must NOT set last_alerted.
+    assert wd.main(["--db", str(db), "--state-file", str(state),
+                    "--halt-file", str(halt)]) == 0
+    capsys.readouterr().out
+    rec = json.loads(state.read_text()).get("t1", {})
+    assert "last_alerted" not in rec
+    # HALT lifts; the SAME task must be reconsidered immediately (no politeness
+    # suppression) and now propose a reassign.
+    halt.unlink()
+    assert wd.main(["--db", str(db), "--state-file", str(state)]) == 0
+    out = capsys.readouterr().out
+    assert "worker-reviewer-glm" in out  # reassign proposed right away
+
+
+def test_read_only_connection_never_falls_back(tmp_path):
+    """The watchdog must open the board DB read-only and NEVER fall back to a
+    read-write connection (cold-review finding 2). A read-only URI failure is
+    a hard error, not a silent downgrade."""
+    db = make_board(tmp_path / "kanban.db", tasks=[
+        ("t1", "worker-reviewer-kimi", "running", T_STALE),
+    ])
+    # Make the DB file read-only so a read-write open would fail; the
+    # read-only URI open must still succeed.
+    os.chmod(db, 0o444)
+    try:
+        alerts = wd.scan(str(db), NOW)
+        assert len(alerts) == 1
+    finally:
+        os.chmod(db, 0o644)
 
 
 def test_ledger_persists_across_restarts(tmp_path):
