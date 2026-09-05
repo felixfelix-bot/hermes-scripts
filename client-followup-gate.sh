@@ -13,6 +13,14 @@ NPUB_HEX="${CLIENT_NPUB_HEX:?missing config: $CFG}"
 STATE="${CLIENT_FOLLOWUP_STATE:?missing config: $CFG}"
 MIN_QUIET_DAYS="${CLIENT_QUIET_DAYS:-7}"
 
+# --- quota pre-gate: if the fleet quota gate trips, say SKIP (agent stays silent,
+#     no nudge marked, retried next week) ---
+QG="$HOME/.hermes/profiles/manager/scripts/zai-quota-gate.sh"
+if [ -x "$QG" ] && ! "$QG" >/dev/null 2>&1; then
+  echo "STATUS=SKIP: quota gate tripped this week."
+  exit 0
+fi
+
 # --- public CONTENT activity check (neutral shared relays only; kind 0 profile
 #     edits are setup noise, not activity) ---
 LAST_ACT=$(nak req wss://relay.damus.io wss://nos.lol wss://relay.primal.net \
