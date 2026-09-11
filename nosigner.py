@@ -11,7 +11,7 @@ Usage:
     python3 nosigner.py --bunker-url <bunker://url> [--one-shot]
 
 Protocol: NIP-46 (Remote Signer)
-Encryption: NIP-44
+Encryption: NIP-04 (AES-256-CBC) + NIP-44 v2, auto-detected per request
 Events: kind 24133 (connect request/response)
 """
 
@@ -31,7 +31,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 import coincurve
-import websockets.asyncio.client as ws_client
+
+try:  # websockets >= 13 exposes the asyncio client under websockets.asyncio
+    import websockets.asyncio.client as ws_client
+except ImportError:  # websockets 12.x — legacy client (same connect()/ping_interval API)
+    import websockets.client as ws_client
+
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -161,18 +166,28 @@ def nip44_decrypt(ciphertext_b64: str, conversation_key: bytes) -> str:
     return pt.decode("utf-8")
 
 
+def ecdh_shared_x(privkey: bytes, pubkey_xonly: bytes) -> bytes:
+    """Raw ECDH shared secret: the 32-byte x coordinate of privkey * P.
+
+    IMPORTANT: this is NOT the same as coincurve's ``PrivateKey.ecdh()``,
+    which returns SHA256(compressed_shared_point). Both NIP-04 and NIP-44
+    use the bare x coordinate as the shared secret.
+
+    The parity prefix (02/03) does not affect the result: d*(x, -y) has the
+    same x coordinate as d*(x, y), so x-only keys are sufficient.
+    """
+    pub = coincurve.PublicKey(bytes([0x02]) + pubkey_xonly)
+    shared = pub.multiply(privkey)
+    return shared.format(compressed=True)[1:]
+
+
 def get_conversation_key(privkey: bytes, pubkey_xonly: bytes) -> bytes:
     """Derive NIP-44 conversation key from private key and remote public key.
 
-    Uses ECDH then HKDF as specified in NIP-44.
+    Uses ECDH (raw x coordinate) then HKDF as specified in NIP-44.
     The pubkey_xonly is the 32-byte x-only public key (Nostr format).
-    For ECDH we need the compressed 33-byte format - we use 02 prefix
-    (even y) since ECDH with x-only is valid for both y parities on the curve.
     """
-    # ECDH: reconstruct compressed pubkey (02 prefix for the x coordinate)
-    compressed_pubkey = bytes([0x02]) + pubkey_xonly
-    our_sk = coincurve.PrivateKey(privkey)
-    shared_point = our_sk.ecdh(compressed_pubkey)
+    shared_point = ecdh_shared_x(privkey, pubkey_xonly)
     # HKDF derivation
     return _hkdf_derive(
         ikm=shared_point,
@@ -180,6 +195,94 @@ def get_conversation_key(privkey: bytes, pubkey_xonly: bytes) -> bytes:
         info=b"nip44-conversation-key",
         length=32,
     )
+
+
+# ── NIP-04 (AES-256-CBC) ───────────────────────────────────────────────────
+#
+# NIP-04 is the older, simpler Nostr encryption used by nak's NIP-46 client:
+#   content = base64(ciphertext) + "?iv=" + base64(iv)
+#   key     = ECDH(privkey, pubkey) — the bare 32-byte x coordinate, NO HKDF
+#   cipher  = AES-256-CBC with PKCS#7 padding
+
+
+def nip04_encrypt(plaintext: str, privkey: bytes, pubkey_xonly: bytes) -> str:
+    """NIP-04 encrypt. Returns 'base64(ct)?iv=base64(iv)'."""
+    import base64
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
+
+    key = ecdh_shared_x(privkey, pubkey_xonly)
+    iv = os.urandom(16)
+
+    padder = PKCS7(128).padder()
+    padded = padder.update(plaintext.encode("utf-8")) + padder.finalize()
+
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    ct = encryptor.update(padded) + encryptor.finalize()
+
+    return f"{base64.b64encode(ct).decode()}?iv={base64.b64encode(iv).decode()}"
+
+
+def _parse_nip04(content: str) -> tuple[bytes, bytes]:
+    """Split 'base64(ct)?iv=base64(iv)' into (ciphertext, iv)."""
+    import base64
+
+    ct_b64, sep, iv_part = content.partition("?")
+    if not sep:
+        raise ValueError("Not NIP-04: no '?' separator")
+    iv_part = iv_part.split("&")[0]
+    if iv_part.startswith("iv="):
+        iv_part = iv_part[3:]
+    if not ct_b64 or not iv_part:
+        raise ValueError("Not NIP-04: empty ciphertext or iv")
+    try:
+        ct = base64.b64decode(ct_b64, validate=False)
+        iv = base64.b64decode(iv_part, validate=False)
+    except Exception as e:  # binascii.Error
+        raise ValueError(f"Not NIP-04: bad base64 ({e})") from e
+    if len(iv) != 16:
+        raise ValueError(f"Not NIP-04: iv is {len(iv)} bytes, expected 16")
+    if not ct or len(ct) % 16 != 0:
+        raise ValueError(f"Not NIP-04: ciphertext is {len(ct)} bytes (not a multiple of 16)")
+    return ct, iv
+
+
+def nip04_decrypt(content: str, privkey: bytes, pubkey_xonly: bytes) -> str:
+    """NIP-04 decrypt of 'base64(ct)?iv=base64(iv)'. Returns plaintext."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
+
+    ct, iv = _parse_nip04(content)
+    key = ecdh_shared_x(privkey, pubkey_xonly)
+
+    decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+    padded = decryptor.update(ct) + decryptor.finalize()
+
+    unpadder = PKCS7(128).unpadder()
+    pt = unpadder.update(padded) + unpadder.finalize()
+    return pt.decode("utf-8")
+
+
+def detect_encryption(content: str) -> str:
+    """Classify an event content string: 'plain' | 'nip04' | 'nip44'."""
+    import base64
+
+    if not content:
+        return "plain"
+    if content.lstrip().startswith("["):
+        return "plain"
+    # NIP-04 always carries a '?' between ciphertext and iv
+    if "?" in content:
+        return "nip04"
+    try:
+        payload = base64.b64decode(content, validate=True)
+    except Exception:
+        return "nip04"  # let the NIP-04 parser produce the real error
+    if payload[:1] == b"\x02":
+        return "nip44"
+    return "nip04"
+
 
 
 # ── Key utilities ──────────────────────────────────────────────────────────
@@ -255,12 +358,17 @@ def privkey_to_pubkey(priv: bytes) -> bytes:
 
 
 def sign_event(privkey: bytes, event_hash: bytes) -> str:
-    """Sign an event hash (32 bytes) with the private key.
-    Returns hex-encoded signature (65 bytes = r||s||v for Nostr).
+    """Sign a 32-byte event id, BIP-340 Schnorr. Returns 128 hex chars (64 bytes).
+
+    NIP-01 requires a 64-byte BIP-340 Schnorr signature. ``sign_recoverable``
+    returns a 65-byte *ECDSA* recoverable signature, which no Nostr client or
+    relay accepts (``nak verify`` → "invalid signature") — that was the second
+    half of the bunker breakage after the NIP-04 decrypt fix.
     """
+    if len(event_hash) != 32:
+        raise ValueError(f"event id must be 32 bytes, got {len(event_hash)}")
     sk = coincurve.PrivateKey(privkey)
-    sig = sk.sign_recoverable(event_hash)
-    return sig.hex()
+    return sk.sign_schnorr(event_hash).hex()
 
 
 def hashlib_sha256(msg: bytes) -> bytes:
@@ -591,6 +699,7 @@ class Nip46Handler:
         self.state = state
         self._pending_pings: dict[str, float] = {}
         self._conversation_keys: dict[str, bytes] = {}  # client_pubkey -> conv_key
+        self._client_enc_mode: dict[str, str] = {}  # client_pubkey -> 'plain'|'nip04'|'nip44'
         self._active_secret: str | None = None
 
     def set_active_secret(self, secret: str) -> None:
@@ -605,30 +714,70 @@ class Nip46Handler:
             )
         return self._conversation_keys[client_pubkey_hex]
 
+    def decrypt_request(
+        self, raw_content: str, client_pubkey: str
+    ) -> tuple[Any, str]:
+        """Decrypt an incoming NIP-46 request content.
+
+        Returns (parsed_content, mode) where mode is 'plain' | 'nip04' | 'nip44'.
+        Raises ValueError when the content cannot be decrypted with any scheme.
+
+        NIP-04 is tried first (nak's NIP-46 client, and most older clients, use
+        it), then NIP-44 v2. The format is detected from the content string, so
+        a client that never encodes NIP-44 still works.
+        """
+        if not raw_content:
+            raise ValueError("empty content")
+
+        # Unencrypted JSON (some test clients)
+        if raw_content.lstrip().startswith("["):
+            return json.loads(raw_content), "plain"
+
+        mode = detect_encryption(raw_content)
+        order = ("nip04", "nip44") if mode == "nip04" else ("nip44", "nip04")
+
+        errors: list[str] = []
+        for scheme in order:
+            try:
+                if scheme == "nip04":
+                    plaintext = nip04_decrypt(
+                        raw_content, self.privkey, bytes.fromhex(client_pubkey)
+                    )
+                else:
+                    conv_key = self.get_conversation_key_for(client_pubkey)
+                    plaintext = nip44_decrypt(raw_content, conv_key)
+                content = json.loads(plaintext)
+            except Exception as e:  # noqa: BLE001 — try the next scheme
+                errors.append(f"{scheme}: {e}")
+                continue
+            if scheme != mode:
+                logger.info(
+                    f"  content detected as {mode} but decrypted with {scheme}; "
+                    f"using {scheme}"
+                )
+            return content, scheme
+
+        raise ValueError("; ".join(errors) or "could not decrypt request")
+
     async def handle_request(self, event: dict[str, Any]) -> dict[str, Any] | None:
         """Handle an incoming NIP-46 request event. Returns response event or None."""
         raw_content = event.get("content", "")
         client_pubkey = event.get("pubkey", "")
 
-        # NIP-46 requests are NIP-44 encrypted. Try to decrypt first.
-        content = None
-        if raw_content.startswith("["):
-            # Unencrypted (rare, some test clients)
-            try:
-                content = json.loads(raw_content)
-            except json.JSONDecodeError:
-                logger.warning(f"Invalid unencrypted content: {raw_content[:100]}")
-                return None
-        else:
-            # Encrypted — decrypt with NIP-44
-            try:
-                conv_key = self.get_conversation_key_for(client_pubkey)
-                decrypted = nip44_decrypt(raw_content, conv_key)
-                content = json.loads(decrypted)
-                logger.debug(f"Decrypted request from {client_pubkey[:16]}...: method={content[1] if len(content) > 1 else '?'}")
-            except Exception as e:
-                logger.warning(f"Failed to decrypt request from {client_pubkey[:16]}...: {e}")
-                return None
+        # NIP-46 requests arrive NIP-04 or NIP-44 encrypted (or rarely plain).
+        try:
+            content, mode = self.decrypt_request(raw_content, client_pubkey)
+            # Remember the scheme so the response uses the same one.
+            self._client_enc_mode[client_pubkey] = mode
+            logger.debug(
+                f"Decrypted request ({mode}) from {client_pubkey[:16]}...: "
+                f"method={content[1] if isinstance(content, list) and len(content) > 1 else '?'}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to decrypt request from {client_pubkey[:16]}...: {e}"
+            )
+            return None
 
         if not isinstance(content, list) or len(content) < 2:
             return None
@@ -676,15 +825,27 @@ class Nip46Handler:
     def _make_response(
         self, req_id: str, result_type: str, result: Any, client_pubkey: str
     ) -> dict[str, Any]:
-        """Create a NIP-46 response event."""
+        """Create a NIP-46 response event.
+
+        The response is encrypted with the same scheme the request arrived in
+        (NIP-04 clients such as nak cannot decrypt a NIP-44 response).
+        """
         response_content = json.dumps([req_id, result_type, result])
-        # Encrypt the response with NIP-44
-        if client_pubkey and client_pubkey in self._conversation_keys:
-            conv_key = self._conversation_keys[client_pubkey]
-            encrypted = nip44_encrypt(response_content, conv_key)
-            content = encrypted
-        else:
-            content = response_content
+        mode = self._client_enc_mode.get(client_pubkey, "nip44")
+        content = response_content
+        if client_pubkey:
+            try:
+                if mode == "nip04":
+                    content = nip04_encrypt(
+                        response_content, self.privkey, bytes.fromhex(client_pubkey)
+                    )
+                elif mode == "nip44":
+                    conv_key = self.get_conversation_key_for(client_pubkey)
+                    content = nip44_encrypt(response_content, conv_key)
+                # mode == 'plain' → leave the response unencrypted
+            except Exception as e:  # noqa: BLE001 — never drop a response
+                logger.warning(f"Failed to encrypt response ({mode}): {e}")
+                content = response_content
 
         return make_event(
             privkey=self.privkey,
@@ -756,14 +917,34 @@ class Nip46Handler:
     async def _handle_nip04_encrypt(
         self, req_id: str, params: list, client_pubkey: str
     ) -> dict[str, Any]:
-        """Handle 'nip04_encrypt'."""
-        return self._make_response(req_id, "error", "NIP-04 not implemented, use NIP-44", client_pubkey)
+        """Handle 'nip04_encrypt' — encrypt plaintext for a target pubkey."""
+        if len(params) < 2:
+            return self._make_response(req_id, "error", "Need plaintext and pubkey", client_pubkey)
+        plaintext = params[0]
+        target_pubkey_hex = params[1]
+        try:
+            encrypted = nip04_encrypt(
+                plaintext, self.privkey, bytes.fromhex(target_pubkey_hex)
+            )
+            return self._make_response(req_id, "ok", encrypted, client_pubkey)
+        except Exception as e:
+            return self._make_response(req_id, "error", str(e), client_pubkey)
 
     async def _handle_nip04_decrypt(
         self, req_id: str, params: list, client_pubkey: str
     ) -> dict[str, Any]:
-        """Handle 'nip04_decrypt'."""
-        return self._make_response(req_id, "error", "NIP-04 not implemented, use NIP-44", client_pubkey)
+        """Handle 'nip04_decrypt' — decrypt NIP-04 ciphertext from a sender."""
+        if len(params) < 2:
+            return self._make_response(req_id, "error", "Need ciphertext and pubkey", client_pubkey)
+        ciphertext = params[0]
+        sender_pubkey_hex = params[1]
+        try:
+            decrypted = nip04_decrypt(
+                ciphertext, self.privkey, bytes.fromhex(sender_pubkey_hex)
+            )
+            return self._make_response(req_id, "ok", decrypted, client_pubkey)
+        except Exception as e:
+            return self._make_response(req_id, "error", str(e), client_pubkey)
 
     async def _handle_nip44_encrypt(
         self, req_id: str, params: list, client_pubkey: str
