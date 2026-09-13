@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "default_tier": "code",
+  "_comment": "CHECKED-IN FALLBACK gate spec for gate_engine.py (mirrors ~/.hermes/bot/gates.json as of 2026-09-13). Used only when none of $HERMES_HOME/bot/gates.json, <root>/bot/gates.json or a gates.json next to the engine module parse. Keep in sync with ~/.hermes/bot/gates.json: cp ~/.hermes/bot/gates.json ~/.hermes/scripts/gates.default.json. D-128 tiered gates. code = hard block; docs = advisory. Unknown => code (fail safe). ci_evidence (2026-09-13): the code/risky tier requires a cited live CI result (ngit CI workflow path + conclusion). A documented absence ('no CI evidence available (reason: ...)') is recognised but never a pass, so it cannot satisfy code. The docs/light tier does NOT require ci_evidence.",
+  "tiers": {
+    "code": {
+      "enforce": "block",
+      "coverage_threshold": 80,
+      "require": ["tests_green", "ci_evidence", "cold_cross_family_review", "pushed_or_consolidated"],
+      "review": { "required": true, "cross_family": true }
+    },
+    "docs": {
+      "enforce": "advisory",
+      "coverage_threshold": 0,
+      "require": ["pushed_or_consolidated"],
+      "review": { "required": false, "cross_family": false }
+    }
+  },
+  "tag_tiers": {
+    "docs": "docs",
+    "documentation": "docs",
+    "readme": "docs",
+    "typo": "docs",
+    "changelog": "docs",
+    "light": "docs",
+    "no-code": "docs"
+  },
+  "board_tiers": {},
+  "families": {
+    "glm": "zhipu",
+    "kimi": "moonshot",
+    "qwen": "alibaba",
+    "deepseek": "deepseek",
+    "gpt": "openai",
+    "o1": "openai",
+    "o3": "openai",
+    "claude": "anthropic",
+    "gemini": "google",
+    "llama": "meta",
+    "mistral": "mistral",
+    "grok": "xai"
+  }
+}
