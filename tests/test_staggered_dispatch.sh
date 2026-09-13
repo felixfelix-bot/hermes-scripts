@@ -369,6 +369,62 @@ t16_empty_resume_at_does_not_shift_fields() {
     assert_eq "$(count_stub_calls 'dispatch')" "0" "t16: still no dispatch under pause"
 }
 
+t17_newline_in_reason_does_not_truncate() {
+    # regression (kimi-family cold review of the T3.2 fix set, finding #8 —
+    # pre-existing): a JSON \n inside the gate reason decodes to a REAL
+    # newline. `read` (herestring, TAB- or US-IFS) stops at the first
+    # newline, so GATE_REASON was truncated there — the board-pause marker
+    # and the 2h/6h manager alerts lost everything after line 1. The fields
+    # are now split on US by parameter expansion (no line-based read), so a
+    # multi-line reason survives intact.
+    # The gate file must carry the escaped form backslash-n (a raw newline is
+    # invalid inside a JSON string); json.load decodes it before the
+    # dispatcher sees it.
+    new_env
+    write_gate true '"2026-08-15T12:00:00+00:00"' \
+        'zai-503-outage: 3 upstream 5xx in 600s\nbody: upstream returned 503 (retry-after 30s)\ntrace: proxy.py:412'
+    local expected=$'zai-503-outage: 3 upstream 5xx in 600s\nbody: upstream returned 503 (retry-after 30s)\ntrace: proxy.py:412'
+    run_dispatch
+    assert_file_exists "$(marker_for alpha)" "t17: marker written despite newline in reason"
+    assert_eq "$(marker_field alpha reason)" "$expected" "t17: full multi-line reason preserved (not truncated at first newline)"
+    assert_eq "$(marker_field alpha resume_at)" "2026-08-15T12:00:00+00:00" "t17: resume_at not shifted by newline"
+    assert_contains "$OUT" "reason=$expected" "t17: log line carries the whole reason"
+    assert_eq "$(count_stub_calls 'dispatch')" "0" "t17: still no dispatch under pause"
+}
+
+t18_newline_reason_with_null_resume_at_keeps_both_fields() {
+    # the two defects composed: an EMPTY resume_at (what the gate emits on
+    # every quota pause) AND a decoded newline inside the reason. The shift
+    # guard and the truncation guard must both hold at once.
+    new_env
+    write_gate true null 'QUOTA-WINDOW: ours 5-hour window at 96.0%\nresets_at unknown — re-check in 30 min'
+    local expected=$'QUOTA-WINDOW: ours 5-hour window at 96.0%\nresets_at unknown — re-check in 30 min'
+    run_dispatch
+    assert_file_exists "$(marker_for alpha)" "t18: marker written (null resume_at + newline reason)"
+    assert_eq "$(marker_field alpha reason)" "$expected" "t18: multi-line reason preserved with empty resume_at"
+    assert_eq "$(marker_field alpha resume_at)" "None" "t18: resume_at stays null"
+    assert_eq "$(count_stub_calls 'dispatch')" "0" "t18: still no dispatch under pause"
+}
+
+t19_literal_us_in_reason_does_not_shift_fields() {
+    # guard (NOT a regression test for the newline bug): after the split was
+    # changed from `read` to parameter expansion, the "reason is LAST and
+    # takes the whole remainder" invariant still has to hold for the WORST
+    # case — a literal US (0x1f, the delimiter itself) inside the reason. The
+    # split consumes exactly the first three US and folds the rest into
+    # GATE_REASON, so the delimiter char in the text is data.
+    # The gate file must carry the escaped form \u001f (a raw 0x1f is invalid
+    # inside a JSON string); json.load decodes it before the dispatcher sees it.
+    new_env
+    write_gate true '"2026-08-15T12:00:00+00:00"' 'zai-503-outage: a\u001fb'
+    local expected='zai-503-outage: a'$'\x1f''b'
+    run_dispatch
+    assert_file_exists "$(marker_for alpha)" "t19: marker written despite US in reason"
+    assert_eq "$(marker_field alpha reason)" "$expected" "t19: literal US inside reason preserved"
+    assert_eq "$(marker_field alpha resume_at)" "2026-08-15T12:00:00+00:00" "t19: resume_at not shifted by US in reason"
+    assert_eq "$(count_stub_calls 'dispatch')" "0" "t19: still no dispatch under pause"
+}
+
 # ---------- run ----------
 echo "== T3.2 staggered-dispatch integration tests =="
 TEST_FILTER="${TESTS:-}"
