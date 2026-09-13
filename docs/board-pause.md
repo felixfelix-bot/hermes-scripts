@@ -30,8 +30,9 @@ violation you should be able to see in the logs.
 ### Parse contract for the gate fields (pinned)
 
 `read_gate_state` emits four fields — `paused`, `quota`, `resume_at`,
-`reason` — joined with **US (0x1f)**, and bash `read`s them back with
-`IFS=$'\x1f'`. Two invariants are load-bearing and must not drift:
+`reason` — joined with **US (0x1f)**, and the dispatcher splits them back on
+`US` with parameter expansion. Four rules are load-bearing and must not
+drift:
 
 1. **The delimiter must be a non-whitespace char.** A TAB does not work:
    bash treats tab as IFS *whitespace*, so consecutive delimiters collapse
@@ -39,11 +40,27 @@ violation you should be able to see in the logs.
    emits on every `-503`/quota-window episode) silently shifted `reason`
    into `GATE_RESUME_AT` and left `GATE_REASON` empty. Fixed 2026-09-13
    (cross-family review finding; commit `975a121`, `t16` leg).
-2. **`reason` must stay the LAST field.** `read -r a b c d` folds every
-   remaining field into the final variable, which is what makes a literal
-   US (or tab, or newline-free text) inside `reason` harmless. A fifth
-   field must therefore be inserted *before* `reason`, never appended after
-   it — otherwise the empty-field shift bug reopens for `resume_at`.
+2. **`reason` must stay the LAST field.** The split folds every remaining
+   field into the final variable, which is what makes a literal US (or tab)
+   inside `reason` harmless. A fifth field must therefore be inserted
+   *before* `reason`, never appended after it — otherwise the empty-field
+   shift bug reopens for `resume_at`.
+3. **The reader must not be line-based.** No `read -r a b c d <<< "$parsed"`
+   (nor any `read` without an explicit non-newline `-d`): `read` stops at the
+   first NEWLINE, so a `reason` carrying a decoded JSON `\n` — multi-line
+   upstream error bodies, joined stack traces — was **truncated at that
+   newline** in the board-pause marker and in the 2h/6h manager alerts.
+   `reason` is *data*: newlines inside it are ordinary bytes. The current
+   split uses parameter expansion on US (`${rest%%$'\x1f'*}` /
+   `${rest#*$'\x1f'}`), which cannot stop early and still preserves empty
+   fields. Fixed 2026-09-13 (kimi-family cold review of the T3.2 fix set,
+   finding #8 — pre-existing; `t17`/`t18` legs). Producers are therefore NOT
+   required to keep `reason` single-line.
+4. **A malformed helper line fails open.** The inline helper always prints
+   exactly four US-joined fields; if fewer than three US delimiters arrive,
+   the output is treated as unparseable (dispatch proceeds, no markers) —
+   the same rule as a missing/corrupt gate file. Never wedge dispatch on our
+   own bug.
 
 
 ## Behavior
@@ -136,7 +153,7 @@ marker management and dispatch) — safe to call manually.
 
 ## Tests
 
-`bash tests/test_staggered_dispatch.sh` — 16 integration legs, 62
+`bash tests/test_staggered_dispatch.sh` — 19 integration legs, 75
 assertions: pause writes markers + skips dispatch (stub + real CLI, with a
 claimable `ready` task left untouched so "no claim" is not vacuous), 429 /
 QUOTA-WINDOW / KALMAN classified, unknown reason → no markers, auto-resume
@@ -147,10 +164,13 @@ quota-paused task via the real CLI with a pre-loaded non-zero
 paused run leaves zero new task_runs, canary fires once after 6 h and not
 before / not twice in a window, 2 h alert fires exactly once per episode,
 marker preserves episode start across passes, a tab inside the reason does not
-shift fields, and an empty `resume_at` (null — what the gate emits) does not
-shift fields either. Legs are hermetic (no leg can spawn a real worker):
-stub-hermes asserts orchestration, `--sweep` and paused full-runs use the real
-CLI with a `HERMES_KANBAN_DB` pin.
+shift fields, an empty `resume_at` (null — what the gate emits) does not
+shift fields either, a decoded `\n` inside the reason is not truncated
+(`t17`), a multi-line reason with a null `resume_at` keeps both fields
+(`t18`), and a literal US (the delimiter itself) inside the reason is data
+(`t19`). Legs are hermetic (no leg can spawn a real worker): stub-hermes
+asserts orchestration, `--sweep` and paused full-runs use the real CLI with a
+`HERMES_KANBAN_DB` pin.
 
 Implementation notes for operators:
 

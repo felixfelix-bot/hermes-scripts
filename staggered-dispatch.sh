@@ -29,9 +29,13 @@
 #   {board, paused_at_epoch, paused_at, updated_at_epoch, reason, resume_at,
 #    alerted_2h, canary_at_epoch, canary_count}
 #   paused_at_* are preserved across passes (episode start); reason/resume_at
-#   track the latest gate state. Known race: if the dispatcher is down while
-#     the gate clears and re-pauses, the marker inherits the old episode age
-#     (worst case: an early alert or one extra canary — both bounded, safe).
+#   track the latest gate state. `reason` is OPAQUE text — it is stored and
+#   alerted verbatim, and it may contain newlines (decoded JSON \n from
+#   multi-line upstream bodies); the gate-field split is newline-proof
+#   (docs/board-pause.md, parse contract rule 3). Known race: if the
+#   dispatcher is down while the gate clears and re-pauses, the marker
+#   inherits the old episode age (worst case: an early alert or one extra
+#   canary — both bounded, safe).
 #
 # Fail-open rules (unchanged from T3.1): missing/unparseable gate file ->
 # dispatch proceeds; an unknown pause reason still skips dispatch (any
@@ -127,8 +131,8 @@ quota = any(reason.startswith(p) for p in prefixes)
 # field shifts left — the reason landed in GATE_RESUME_AT and GATE_REASON came
 # back empty (found by the T3.2 cross-family review, fixed here). 0x1f is a
 # non-whitespace delimiter, so empty fields are preserved. reason still goes
-# LAST so a literal US inside it can't shift fields — `read -r a b c d` folds
-# everything remaining into the final variable.
+# LAST so a literal US inside it can't shift fields — the split folds
+# everything remaining into GATE_REASON.
 print(f"{1 if paused else 0}\x1f{1 if quota else 0}\x1f{resume}\x1f{reason}")
 PY
 )
@@ -136,8 +140,31 @@ PY
         log "gate file unparseable ($GATE_FILE); proceeding (fail-open)"
         return 0
     fi
+    # Newline-proof split (kimi cold review finding #8, pre-existing): a
+    # `read ... <<<"$parsed"` stops at the first NEWLINE, so a reason carrying
+    # a decoded JSON \n (multi-line upstream bodies / stack traces) was
+    # truncated at that newline in the board-pause marker and in the 2h/6h
+    # manager alerts. Parameter expansion on US treats newlines as ordinary
+    # bytes: it cannot stop early, and it keeps empty fields (0x1f is not
+    # whitespace). GATE_REASON takes the whole remainder, so a literal US
+    # inside the reason is still harmless.
+    local rest="$parsed" fields=()
+    while [ "${#fields[@]}" -lt 3 ] && [[ "$rest" == *$'\x1f'* ]]; do
+        fields+=("${rest%%$'\x1f'*}")
+        rest="${rest#*$'\x1f'}"
+    done
+    if [ "${#fields[@]}" -ne 3 ]; then
+        # Our own helper misbehaved (it always prints 4 US-joined fields):
+        # never wedge dispatch on our bugs — same fail-open rule as a corrupt
+        # gate file (contract pinned in docs/board-pause.md).
+        log "gate helper output malformed (missing US delimiter); proceeding (fail-open)"
+        return 0
+    fi
     GATE_KNOWN=1
-    IFS=$'\x1f' read -r GATE_PAUSED GATE_QUOTA GATE_RESUME_AT GATE_REASON <<< "$parsed"
+    GATE_PAUSED="${fields[0]}"
+    GATE_QUOTA="${fields[1]}"
+    GATE_RESUME_AT="${fields[2]}"
+    GATE_REASON="$rest"
 }
 
 # Binary gate verdict for the dispatch loop (unchanged contract).
