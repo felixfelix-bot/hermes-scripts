@@ -274,8 +274,33 @@ if [ -x "$APPLY" ] || [ -f "$APPLY" ]; then
     if [ "$RC" -ne 0 ]; then ok "t17a: helper refuses an unrecognized base without --force"; else bad "t17a: helper applied to an unrecognized base"; fi
     assert_eq "$(md5sum "$HU" | cut -d' ' -f1)" "$B4" "t17b: refused run left the file untouched"
 
+    # ---- t19 partial state (heading only) must be REFUSED, not "already applied"
+    HP="$(stage "$FIX_A" helperPartial)"
+    printf '\n%s\n' '### Special prefix: `quota-paused:`' >> "$HP"
+    BP="$(md5sum "$HP" | cut -d' ' -f1)"
+    OUT="$(bash "$APPLY" --target "$HP" 2>&1)"; RC=$?
+    if [ "$RC" -ne 0 ]; then ok "t19a: helper refuses a partially-applied file"; else bad "t19a: helper accepted a partial state (rc=0)"; fi
+    case "$OUT" in
+        *REFUSED*partial*) ok "t19b: refusal names the partial-state reason" ;;
+        *) bad "t19b: refusal message unclear ($OUT)" ;;
+    esac
+    assert_eq "$(md5sum "$HP" | cut -d' ' -f1)" "$BP" "t19c: refused run left the partial file untouched"
+
+    # ---- t20 a partial APPLY must not leave a .rej in the tree
+    # corrupt hunk 2's trailing context so hunk 1 lands and hunk 2 is rejected
+    HR="$(stage "$FIX_A" helperRej)"
+    sed -i 's/^## Heartbeats worth sending$/## Heartbeats worth sending (renamed)/' "$HR"
+    BR="$(md5sum "$HR" | cut -d' ' -f1)"
+    OUT="$(bash "$APPLY" --force --target "$HR" 2>&1)"; RC=$?
+    if [ "$RC" -ne 0 ]; then ok "t20a: partial apply fails loudly (rc=$RC)"; else bad "t20a: partial apply returned success"; fi
+    case "$OUT" in
+        *"removed stray reject file"*) ok "t20b: helper removed the stray reject file" ;;
+        *) bad "t20b: no .rej cleanup reported ($OUT)" ;;
+    esac
+    if [ -e "$HR.rej" ]; then bad "t20c: .rej left behind: $HR.rej"; else ok "t20c: no .rej left in the tree"; fi
+    assert_eq "$(md5sum "$HR" | cut -d' ' -f1)" "$BR" "t20d: failed apply restored the file byte-identical"
 else
-    bad "t15-t17: apply helper missing ($APPLY)"
+    bad "t15-t20: apply helper missing ($APPLY)"
 fi
 
 # ---------- t18 runtime skill-load check ----------
