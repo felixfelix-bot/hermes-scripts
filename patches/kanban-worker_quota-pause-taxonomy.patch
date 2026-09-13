@@ -1,0 +1,89 @@
+--- a/devops/kanban-worker/SKILL.md
++++ b/devops/kanban-worker/SKILL.md
+@@ -2,5 +2,5 @@
+ name: kanban-worker
+ description: Pitfalls, examples, and edge cases for Hermes Kanban workers. The lifecycle itself is auto-injected into every worker's system prompt as KANBAN_GUIDANCE (from agent/prompt_builder.py); this skill is what you load when you want deeper detail on specific scenarios.
+-version: 2.0.0
++version: 2.1.0
+ platforms: [linux, macos, windows]
+ environments: [kanban]
+@@ -144,4 +144,79 @@
+ 
++### Special prefix: `quota-paused:` (z.ai quota/outage — never a task defect)
++
++When the LLM upstream itself is down or rate-limited, blocking as though the
++task were broken burns the board's retry budget and your context for nothing.
++Recognise the outage signature, block ONCE and EARLY, and let the T3.2 sweeper
++re-queue you when the gate clears. The names below are the pinned T3.1/T3.2
++contract: gate reason `zai-503-outage`, block-reason prefix `quota-paused:`.
++
++**Quota/outage signature — all four, not any one of them:**
++
++| # | Signal | How to check |
++|---|---|---|
++| 1 | Failure at the **first** LLM call, before any tool work | your own transcript |
++| 2 | HTTP **503** (or 429) whose text mentions quota / capacity / upstream, from `localhost:9099` (the z.ai proxy) or the routstr upstream | the tool result / error trace |
++| 3 | The gate file says **paused** with a **quota-class** reason (the T3.3 spec's shorthand for this is "a `zai-*` reason") | `python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.hermes/state/rate_limit_gate.json')));print(d['paused'],'|',d['reason'],'|',d['resume_at'])"` |
++| 4 | The failure is **identical across unrelated steps** — repeating the call, or switching to unrelated work, fails the same way | your own transcript |
++
++The quota-class reasons are the four prefixes pinned by T3.1/T3.2 (see
++`docs/board-pause.md`, `QUOTA_REASON_PREFIXES`): `zai-503-outage:` (recent 503
++burst — the `zai-*` prefix T3.2/T3.3 match on), `ACTIVE 429:`,
++`QUOTA-WINDOW:` (a 5h / weekly / monthly window ≥85% used) and `KALMAN:`
++(predicted exhaustion). `ADVISORY: …` means `paused=false` — that is NOT this
++case; keep working.
++
++**Action — block once, early, then stop:**
++
++```python
++kanban_block(
++    reason="quota-paused: gate says <reason>, resume_at <ts> — no work lost, not a task defect",
++)
++# real shape:
++# quota-paused: gate says zai-503-outage: 4 server errors in 600s,
++# resume_at 2026-08-15T17:20:00+00:00 — no work lost, not a task defect
++```
++
++- Block within **≤10 iterations** of the first signature hit. Do not "retry once
++  more to be sure", and do not grind to your iteration budget (50/90) — an
++  outage is not something more iterations can fix.
++- NEVER `kanban_complete` under this signature: nothing was verified, so a
++  completion would be a false report.
++- Keep the prefix EXACTLY `quota-paused:` at position 0 — the T3.2 sweeper
++  matches `reason.startswith("quota-paused:")`. Any other spelling leaves your
++  task blocked until a human notices it.
++- Quote the gate's own `reason` and `resume_at`. If `resume_at` is `null`, write
++  `resume_at unknown (gate re-evaluates every 5 min)` — do not drop the field,
++  readers parse it.
++- This block is **not a failure**: the failure counter is not incremented, and
++  once the gate is confirmed clear the task returns to `ready` on its own, so
++  the respawn is free.
++- No follow-up cards, no state mutations. If you already produced partial
++  results, one comment recording them is useful; otherwise the block says it all.
++
++**Real failure — do NOT use this prefix:**
++
++- The failure is task-specific: it happens at *different* steps, names concrete
++  files/hosts/logic, or changes when you change what you are doing.
++- It is not a model outage at all: SSH / DNS / docker / permission / disk
++  errors, a missing binary, a failing test, a provider **401** (auth or config
++  bug, not quota), or the dispatcher's pre-flight load/RAM gate (which skips a
++  pass and writes no marker — a skipped pass is not a quota pause).
++- Action: the normal diagnose → fix → `kanban_block("blocked: <specific diagnosis>")` flow.
++
++**Tie-breaker:** still unsure after **2 probes spaced ~10 min apart** (a probe =
++re-read the gate file + retry the smallest LLM step) **and the gate is clear** →
++treat it as a real failure and continue the normal flow.
++
++**What happens next, so you don't fight it:** on a quota-class pause the
++dispatcher writes `~/.hermes/state/board_pause_<board>` and skips the whole
++board — no claims, no promotes, no failure accounting — so tasks simply sit
++`ready`. After 6 h one canary claim probes a stale gate. When the gate clears
++the markers are removed and every `quota-paused:` task is unblocked; you will
++normally be respawned with this thread, so re-read it before redoing work.
++
++
++
+ ## Heartbeats worth sending
+ 
+ Good heartbeats name progress: `"epoch 12/50, loss 0.31"`, `"scanned 1.2M/2.4M rows"`, `"uploaded 47/120 videos"`.
