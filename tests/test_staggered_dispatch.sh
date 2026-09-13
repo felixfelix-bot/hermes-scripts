@@ -425,6 +425,23 @@ t19_literal_us_in_reason_does_not_shift_fields() {
     assert_eq "$(count_stub_calls 'dispatch')" "0" "t19: still no dispatch under pause"
 }
 
+t20_multiline_reason_survives_in_2h_alert() {
+    # the finding's operator-visible impact is not only the marker file: the
+    # 2h manager alert (and the 6h canary alert) render the gate reason into
+    # the alert text. Pre-fix, that text was truncated at the first newline
+    # too — the operator saw a stack trace / body cut mid-sentence.
+    new_env
+    write_gate true '"2026-08-15T12:00:00+00:00"' \
+        'zai-503-outage: 3 upstream 5xx in 600s\nbody: upstream returned 503 (retry-after 30s)'
+    local expected=$'zai-503-outage: 3 upstream 5xx in 600s\nbody: upstream returned 503 (retry-after 30s)'
+    fabricate_marker alpha 7300          # paused for >2h already
+    run_dispatch
+    assert_contains "$OUT" "ALERT board-paused >2h" "t20: 2h alert fired"
+    assert_contains "$OUT" "reason='$expected'" "t20: 2h manager alert carries the full multi-line reason"
+    assert_eq "$(marker_field alpha reason)" "$expected" "t20: marker reason is the multi-line gate reason"
+    assert_eq "$(count_stub_calls 'dispatch')" "0" "t20: still no dispatch under pause"
+}
+
 # ---------- run ----------
 echo "== T3.2 staggered-dispatch integration tests =="
 TEST_FILTER="${TESTS:-}"

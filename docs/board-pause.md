@@ -153,7 +153,7 @@ marker management and dispatch) — safe to call manually.
 
 ## Tests
 
-`bash tests/test_staggered_dispatch.sh` — 19 integration legs, 75
+`bash tests/test_staggered_dispatch.sh` — 20 integration legs, 79
 assertions: pause writes markers + skips dispatch (stub + real CLI, with a
 claimable `ready` task left untouched so "no claim" is not vacuous), 429 /
 QUOTA-WINDOW / KALMAN classified, unknown reason → no markers, auto-resume
@@ -167,8 +167,11 @@ marker preserves episode start across passes, a tab inside the reason does not
 shift fields, an empty `resume_at` (null — what the gate emits) does not
 shift fields either, a decoded `\n` inside the reason is not truncated
 (`t17`), a multi-line reason with a null `resume_at` keeps both fields
-(`t18`), and a literal US (the delimiter itself) inside the reason is data
-(`t19`). Legs are hermetic (no leg can spawn a real worker): stub-hermes
+(`t18`), a literal US (the delimiter itself) inside the reason is data
+(`t19`), and a multi-line reason reaches the 2 h manager-alert text AND the
+marker intact (`t20`) — the alert renders the reason verbatim, so it was
+truncated pre-fix too. Legs are hermetic (no leg can spawn a real worker):
+stub-hermes
 asserts orchestration, `--sweep` and paused full-runs use the real CLI with a
 `HERMES_KANBAN_DB` pin.
 
