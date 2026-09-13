@@ -74,6 +74,7 @@ def tick(slugs, since_min, gates, report=False):
     cutoff = int(time.time()) - since_min * 60
     state = _load()
     changes = []
+    skipped = []
     for bdir in _boards(slugs):
         db = bdir / "kanban.db"
         if not db.exists():
@@ -81,9 +82,16 @@ def tick(slugs, since_min, gates, report=False):
         board = bdir.name
         conn = sqlite3.connect(str(db))
         try:
-            rows = conn.execute(
-                "select id from tasks where status='done' and "
-                "(completed_at is null or completed_at>=?)", (cutoff,)).fetchall()
+            try:
+                rows = conn.execute(
+                    "select id from tasks where status='done' and "
+                    "(completed_at is null or completed_at>=?)", (cutoff,)).fetchall()
+            except sqlite3.OperationalError as exc:
+                # A board directory can hold a DB with no schema (e.g. _archived/,
+                # or a stub created before the board was ever used). That is not a
+                # reason to abort the whole tick: skip it and keep going.
+                skipped.append(f"{board}: {exc}")
+                continue
             for (tid,) in rows:
                 key = f"{board}:{tid}"
                 res = ge.evaluate_task(board, tid, gates)
@@ -117,6 +125,8 @@ def tick(slugs, since_min, gates, report=False):
                 changes.append(res)
         finally:
             conn.close()
+    if skipped:
+        print(f"gate-tick: skipped {len(skipped)} unusable board db(s): " + "; ".join(skipped[:3]))
     if changes and not report:
         _save(state)
     return changes
@@ -126,7 +136,8 @@ def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--board", action="append", dest="boards")
     ap.add_argument("--since-min", type=int, default=1440)
-    ap.add_argument("--report", action="store_true")
+    ap.add_argument("--report", action="store_true", help="report only (advisory)")
+    ap.add_argument("--enforce", action="store_true", help="apply changes; default is advisory so a new gate cannot mass-block a backlog")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     gates = ge.load_gates()
@@ -137,7 +148,10 @@ def main(argv):
         print(f"[gate-tick] SPEC ERROR — refusing to run: {gates['_spec_error']}")
         print(f"[gate-tick] spec paths tried: {gates.get('_spec_tried')}")
         return 2
-    changes = tick(args.boards, args.since_min, gates, report=args.report)
+    # ADVISORY BY DEFAULT (operator decision pending): a newly-enabled gate
+    # must not mass-block a backlog of already-done cards. Pass --enforce to apply.
+    report = True if not args.enforce else bool(args.report)
+    changes = tick(args.boards, args.since_min, gates, report=report)
     if args.json:
         print(json.dumps(changes, indent=1))
     elif changes:
