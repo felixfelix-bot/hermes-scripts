@@ -335,8 +335,10 @@ t14_quota_window_and_kalman_reasons_are_quota_class() {
 }
 
 t15_tab_in_reason_does_not_shift_fields() {
-    # regression: gate reason containing a tab must not corrupt
-    # GATE_REASON/GATE_RESUME_AT field parsing (reason is the LAST field).
+    # guard (NOT a regression test for the empty-resume_at bug: with reason
+    # LAST, a tab inside reason folds into GATE_REASON under TAB-IFS too, so
+    # this leg passes both before and after the US-delimiter fix — it pins the
+    # "reason is last + folded remainder" invariant against future refactors).
     # The gate file must carry the escaped form backslash-t (a raw tab is
     # invalid JSON); json.load decodes it to a real tab before the
     # dispatcher sees it.

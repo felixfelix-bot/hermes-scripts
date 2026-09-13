@@ -27,6 +27,25 @@ violation you should be able to see in the logs.
 
 `ADVISORY: …` is `paused=false` → dispatch proceeds (peak-hour caution only).
 
+### Parse contract for the gate fields (pinned)
+
+`read_gate_state` emits four fields — `paused`, `quota`, `resume_at`,
+`reason` — joined with **US (0x1f)**, and bash `read`s them back with
+`IFS=$'\x1f'`. Two invariants are load-bearing and must not drift:
+
+1. **The delimiter must be a non-whitespace char.** A TAB does not work:
+   bash treats tab as IFS *whitespace*, so consecutive delimiters collapse
+   and a quota pause with `resume_at: null` (what `rate_limit_gate.py`
+   emits on every `-503`/quota-window episode) silently shifted `reason`
+   into `GATE_RESUME_AT` and left `GATE_REASON` empty. Fixed 2026-09-13
+   (cross-family review finding; commit `975a121`, `t16` leg).
+2. **`reason` must stay the LAST field.** `read -r a b c d` folds every
+   remaining field into the final variable, which is what makes a literal
+   US (or tab, or newline-free text) inside `reason` harmless. A fifth
+   field must therefore be inserted *before* `reason`, never appended after
+   it — otherwise the empty-field shift bug reopens for `resume_at`.
+
+
 ## Behavior
 
 ### Pause (quota-class gate pause)
