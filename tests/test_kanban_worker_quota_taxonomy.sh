@@ -18,7 +18,7 @@
 #   t9  all taxonomy markers present after apply (fixture B)
 #   t10 the inserted section is byte-identical in both variants (one canonical text)
 #   t11 the section is inserted exactly once (no double insert)
-#   t12 frontmatter still parses; name/description kept; version 2.0.0 -> 2.1.0
+#   t12 frontmatter still parses; name/description kept; version 2.0.0 -> 2.2.0
 #   t13 the change is reversible (patch -R dry-run succeeds on the applied file)
 #   t14 NEGATIVE control: patch must NOT apply to an unrelated skill doc
 #   t15 apply helper: applies to a base-A copy, verifies markers, writes a backup
@@ -26,6 +26,9 @@
 #   t17 apply helper: unknown base without --force refuses and touches nothing
 #   t18 runtime skill-load check (verify_skill_loads.py): the patched skill is
 #       still discoverable by Hermes' manifest scanner, same key set as control
+#   t19 apply helper: a PARTIALLY applied file (some, not all markers) is
+#       refused as an unknown state and left byte-identical
+#   t20 apply helper: a partial apply's stray .rej is removed (no litter)
 #
 # Hermetic legs run against tests/fixtures/kanban-worker-anchor-{A,B}.md (a
 # minimal, exact-context reduction of both real variants). Live-fleet legs run
@@ -219,7 +222,7 @@ print("%s|%s|%s|%s" % (a.get("name"), a.get("version"),
                        a.get("metadata") == b.get("metadata")))
 PY
 )" 2>&1
-assert_eq "$FM" "kanban-worker|2.1.0|True|True" "t12: frontmatter parses, name/description/metadata kept, version 2.1.0"
+assert_eq "$FM" "kanban-worker|2.2.0|True|True" "t12: frontmatter parses, name/description/metadata kept, version 2.2.0"
 
 # ---------- t13 reversible ----------
 patch_run "$A_APPLIED" --dry-run -R
@@ -270,6 +273,7 @@ if [ -x "$APPLY" ] || [ -f "$APPLY" ]; then
     OUT="$(bash "$APPLY" --target "$HU" 2>&1)"; RC=$?
     if [ "$RC" -ne 0 ]; then ok "t17a: helper refuses an unrecognized base without --force"; else bad "t17a: helper applied to an unrecognized base"; fi
     assert_eq "$(md5sum "$HU" | cut -d' ' -f1)" "$B4" "t17b: refused run left the file untouched"
+
 else
     bad "t15-t17: apply helper missing ($APPLY)"
 fi

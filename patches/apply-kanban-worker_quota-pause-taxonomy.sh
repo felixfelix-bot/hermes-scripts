@@ -19,6 +19,9 @@
 #   * timestamped .bak written before any write;
 #   * applied with --fuzz=0 (context must match exactly, offsets are fine);
 #   * post-apply marker verification; on failure the backup is restored;
+#   * a partially-applied file (some but not all markers) is REFUSED as an
+#     unknown state — restore the .bak-* backup or re-anchor, never guess;
+#   * a partial apply's `.rej` is removed so no litter is left in the tree;
 #   * re-running on an already-patched file is a no-op (idempotent).
 set -u
 
@@ -43,7 +46,7 @@ while [ "$#" -gt 0 ]; do
         --force) FORCE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --patch) PATCH="${2:?--patch needs a path}"; shift 2 ;;
-        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -73,8 +76,21 @@ for TARGET in "${TARGETS[@]}"; do
     fi
     BEFORE="$(md5of "$TARGET")"
 
-    if grep -qF -- "$MARKER_HEAD" "$TARGET"; then
+    # idempotency: require ALL markers. A file with only some of them is an
+    # unknown partial state (interrupted apply / hand edit), NOT "already done".
+    present=0
+    for m in "$MARKER_HEAD" "$MARKER_REASON" "$MARKER_CONTRACT"; do
+        grep -qF -- "$m" "$TARGET" && present=$((present + 1))
+    done
+    if [ "$present" -eq 3 ]; then
         echo "   no-op: taxonomy already applied (md5 $BEFORE)"
+        continue
+    fi
+    if [ "$present" -ne 0 ]; then
+        echo "   REFUSED: partial state ($present/3 markers present) — neither a known"
+        echo "            base nor a fully patched file. Restore the .bak-* backup, or"
+        echo "            re-anchor; this script will not guess."
+        RC=1
         continue
     fi
 
@@ -102,6 +118,14 @@ for TARGET in "${TARGETS[@]}"; do
     cp -p "$TARGET" "$BAK"
     OUT="$(cd "$(skills_root_of "$TARGET")" && patch -p1 --batch --fuzz=0 < "$PATCH" 2>&1)"; PRC=$?
     echo "$OUT" | sed 's/^/   /'
+
+    # a partially-applied file leaves a .rej beside the target: never leave
+    # litter (reject files) in an operator skills tree
+    REJ="${TARGET}.rej"
+    if [ -e "$REJ" ]; then
+        rm -f "$REJ"
+        echo "   removed stray reject file: $REJ"
+    fi
 
     okmark=1
     if [ "$PRC" -ne 0 ]; then okmark=0; echo "   patch failed (rc=$PRC)"; fi

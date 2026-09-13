@@ -15,7 +15,7 @@ was modified by the drafting run. The manager applies it — see
 |---|---|
 | `patches/kanban-worker_quota-pause-taxonomy.patch` | the `-p1` patch: version bump + the taxonomy section, anchored to apply to every current fleet variant |
 | `patches/apply-kanban-worker_quota-pause-taxonomy.sh` | apply helper: base preflight, backup, `--fuzz=0` apply, marker verification, restore-on-failure, idempotent, `--dry-run`/`--force` |
-| `tests/test_kanban_worker_quota_taxonomy.sh` | 35-assertion gate suite (patch shape, apply matrix, markers, canonical text, frontmatter, reversibility, negative control, helper behaviour) |
+| `tests/test_kanban_worker_quota_taxonomy.sh` | 42-assertion gate suite (patch shape, apply matrix, markers, canonical text, frontmatter, reversibility, negative control, helper behaviour incl. partial-state refusal and `.rej` hygiene) |
 | `tests/verify_skill_loads.py` | runtime check: the patched skill is still discoverable by Hermes' manifest scanner |
 | `tests/fixtures/kanban-worker-anchor-{A,B}.md` | hermetic, exact-context reductions of the two dominant fleet variants |
 
@@ -75,15 +75,29 @@ Verified apply matrix, `--fuzz=0` (all 79 copies tried):
 - ⚠️ `~/.hermes/profiles/worker-plebeian/skills/devops/kanban-worker/SKILL.md`
   — **not** applied. Its frontmatter is already `2.1.0` (the patch's hunk 1 is
   detected as reversed) and it drifts near the anchor. Re-anchor with the
-  taxonomy section only and land it as **`2.2.0`**, so `2.1.0` keeps meaning
-  that copy's content.
+  taxonomy section only and land it as **`2.3.0`**.
+
+**Version numbering — why this patch bumps base A to `2.2.0` and not `2.1.0`.**
+`2.1.0` is already taken fleet-wide by the `worker-plebeian` generation, whose
+content is **different** (it carries the 2026-09-11 `kanban_request_review`
+guidance that this patch does not add). Had this patch also claimed `2.1.0`,
+the version field would stop identifying content: two different files would
+answer to the same number, and anyone diffing versions would wrongly conclude
+that the base-A copies carry the request_review guidance. Reserved numbering:
+
+| version | content |
+|---|---|
+| `2.0.0` | both older variants (base A default/worker copies, base B manager SoT) |
+| `2.1.0` | `worker-plebeian` generation, pre-taxonomy |
+| `2.2.0` | base A + taxonomy (**this patch**) and base B + taxonomy |
+| `2.3.0` | `worker-plebeian` generation + taxonomy (the re-anchoring follow-up) |
 
 Applied-content fingerprints (post-patch md5, for spot-checking):
 
 | base | applied md5 |
 |---|---|
-| base A (all 71 copies) | `8a8fcb110a86390bab345ca6acfd471d` |
-| base B (manager SoT) | `9e8f1fd00ad199f87462e5422759ecc1` |
+| base A (all 71 copies) | `929c0ccc93b1d22af937ee8476e60eeb` |
+| base B (manager SoT) | `90d4914fc677f8d49640ee4a0660528d` |
 
 ### Anchor rationale
 
@@ -143,7 +157,10 @@ explicit approval as this patch.
 
 ```bash
 bash tests/test_kanban_worker_quota_taxonomy.sh
-# expected (full fleet present): PASS=35 FAIL=0 SKIP=0
+# expected (full fleet present): PASS=42 FAIL=0 SKIP=0
+#   RED baseline for the fixed properties (new suite vs the pre-fix patch +
+#   pre-fix helper): PASS=37 FAIL=5 exit 1 — t12 (version), t19a/t19b
+#   (partial-state refusal), t20b/t20c (.rej litter).
 #   "skip-" lines appear only for live copies absent on the host; the hermetic
 #   fixture legs (t3/t4/t8-t11) always run.
 python3 tests/verify_skill_loads.py        # runtime manifest check (exit 3 = SKIP if no scanner)
@@ -180,9 +197,34 @@ cp <copy> "$W/skills/devops/kanban-worker/SKILL.md"
 (cd "$W/skills" && patch -p1 --batch --fuzz=0 --dry-run < patches/kanban-worker_quota-pause-taxonomy.patch)
 ```
 
+## Cross-family cold review (Gate 2.5)
+
+| field | value |
+|---|---|
+| reviewer | `moonshotai/Kimi-K3-TEE` (moonshot family — opposite of the deepseek worker) |
+| route | chutes (`llm.chutes.ai`). The zai proxy kimi/glm routes returned HTTP 503 `all providers exhausted (flat router)` at review time; deepseek routes were fine, so this was a **model-route** outage, not a board quota pause (gate file `paused=false`) — the T3.3 taxonomy's own distinction. |
+| prompt | diff + task description + Gate-2 test output only; zero design context |
+| verdict | **CHANGES_REQUESTED** — 1 major, 4 minor |
+| verdict file | `~/.hermes/kanban/boards/hermes-for-friends/attachments/t_87e5657d/kimi-t33-verdict.json` |
+
+All five findings were addressed before re-review:
+
+| # | sev | finding | fix |
+|---|---|---|---|
+| 1 | **major** | version bump to `2.1.0` collides with the pre-existing `worker-plebeian` `2.1.0`, and the doc sentence "`2.1.0` keeps meaning that copy's content" contradicted the patch's own numbering | patch now bumps to **`2.2.0`**; the doc states the reserved numbering table and the plebeian follow-up moves to `2.3.0` |
+| 2 | minor | quota prefixes listed with trailing colons (`ACTIVE 429:`) although `QUOTA_REASON_PREFIXES` is colon-*separated* tokens with no trailing colon | the section now quotes the sweeper's token list verbatim and shows the gate's real emitted reason shapes (`ACTIVE 429: <detail>` etc.) |
+| 3 | minor | restore-on-failure left a stray `SKILL.md.rej` in a (possibly live) skills tree | helper removes the `.rej` immediately after the apply; leg **t20** proves no litter |
+| 4 | minor | idempotency keyed on one marker — a partial/interrupted apply would be reported "already applied" and skipped | helper requires **all three** markers for the no-op; some-but-not-all is refused as an unknown state; leg **t19** proves the refusal |
+| 5 | minor | the insert left 3 extra blank lines (4 consecutive) before the H2 heading | collapsed to a single blank line |
+
+The reviewer independently confirmed: the three contract names are verbatim-correct
+against T3.1/T3.2, **no test leg mutates a live skill copy** (the D9=B constraint),
+the helper's preflight/backup/restore logic is correct, and the assertions are
+non-vacuous (t2e, t10b, t12, t13, t14 specifically called out).
+
 ## Follow-ups this patch does not cover
 
-1. Re-anchor for the `worker-plebeian` generation (already `2.1.0`) → land as `2.2.0`.
+1. Re-anchor for the `worker-plebeian` generation (already `2.1.0`) → land as `2.3.0`.
 2. Decide + execute the fleet skill-sync fix (profile-local copies shadow the SoT).
 3. The taxonomy is worker-side guidance only: until the dispatcher's board-pause
    lands mid-run, workers still discover the outage by the *signature*, not by

@@ -4,10 +4,10 @@
  name: kanban-worker
  description: Pitfalls, examples, and edge cases for Hermes Kanban workers. The lifecycle itself is auto-injected into every worker's system prompt as KANBAN_GUIDANCE (from agent/prompt_builder.py); this skill is what you load when you want deeper detail on specific scenarios.
 -version: 2.0.0
-+version: 2.1.0
++version: 2.2.0
  platforms: [linux, macos, windows]
  environments: [kanban]
-@@ -144,4 +144,79 @@
+@@ -144,4 +144,86 @@
  
 +### Special prefix: `quota-paused:` (z.ai quota/outage — never a task defect)
 +
@@ -26,12 +26,21 @@
 +| 3 | The gate file says **paused** with a **quota-class** reason (the T3.3 spec's shorthand for this is "a `zai-*` reason") | `python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.hermes/state/rate_limit_gate.json')));print(d['paused'],'|',d['reason'],'|',d['resume_at'])"` |
 +| 4 | The failure is **identical across unrelated steps** — repeating the call, or switching to unrelated work, fails the same way | your own transcript |
 +
-+The quota-class reasons are the four prefixes pinned by T3.1/T3.2 (see
-+`docs/board-pause.md`, `QUOTA_REASON_PREFIXES`): `zai-503-outage:` (recent 503
-+burst — the `zai-*` prefix T3.2/T3.3 match on), `ACTIVE 429:`,
-+`QUOTA-WINDOW:` (a 5h / weekly / monthly window ≥85% used) and `KALMAN:`
-+(predicted exhaustion). `ADVISORY: …` means `paused=false` — that is NOT this
-+case; keep working.
++The quota-class reasons are pinned by T3.1/T3.2 as the sweeper's prefix tokens
++`QUOTA_REASON_PREFIXES="zai-:ACTIVE 429:QUOTA-WINDOW:KALMAN"` — colon-separated
++in that variable; the tokens themselves carry NO trailing colon, and the sweeper
++matches them with `reason.startswith(token)`. A pause for any of the four is
++this case. The gate's own reason always continues with `: ` after the tag, as
++the gate writes it:
++
++| token | what it means | example gate reason |
++|---|---|---|
++| `zai-` | recent upstream 503/5xx burst — the `zai-*` shorthand T3.2/T3.3 match on | `zai-503-outage: <n> upstream 503/5xx in last <window>s` |
++| `ACTIVE 429` | live 429 rate limiting | `ACTIVE 429: <gate detail>` |
++| `QUOTA-WINDOW` | a 5 h / weekly / monthly window ≥85% used | `QUOTA-WINDOW: <key> <name> window at <pct>% (>= <threshold>% threshold) — advisory pause until window reset` |
++| `KALMAN` | predicted exhaustion | `KALMAN: <gate detail>` |
++
++`ADVISORY: …` means `paused=false` — that is NOT this case; keep working.
 +
 +**Action — block once, early, then stop:**
 +
@@ -81,8 +90,6 @@
 +`ready`. After 6 h one canary claim probes a stale gate. When the gate clears
 +the markers are removed and every `quota-paused:` task is unblocked; you will
 +normally be respawned with this thread, so re-read it before redoing work.
-+
-+
 +
  ## Heartbeats worth sending
  
