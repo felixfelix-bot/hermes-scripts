@@ -55,7 +55,30 @@ drift:
    `${rest#*$'\x1f'}`), which cannot stop early and still preserves empty
    fields. Fixed 2026-09-13 (kimi-family cold review of the T3.2 fix set,
    finding #8 — pre-existing; `t17`/`t18` legs). Producers are therefore NOT
-   required to keep `reason` single-line.
+   required to keep `reason` single-line. Three consequences are pinned, not
+   assumed:
+
+   - **The marker round-trips a multi-line reason.** Markers are JSON
+     (`json.dump`/`json.load`, `staggered-dispatch.sh` ~L250/~L218), so a raw
+     newline in `reason` is escaped on write and decoded on read; the fields
+     *after* `reason` (`alerted_2h`, `canary_at_epoch`, `canary_count`) keep
+     surviving across passes, which is what makes the 2 h alert fire exactly
+     once per episode. Pinned by `t21` (two passes; the leg was
+     mutation-checked against a "always re-alert" mutant, which it fails).
+   - **Trailing newlines are lost.** The helper's output is captured with
+     `$(...)`, and command substitution strips trailing newlines, so a
+     `reason` ending in `\n` arrives without it. Pre-existing and bounded;
+     the parser cannot preserve what the capture already removed.
+   - **Log consumers must not assume one record per line.** A multi-line
+     `reason` is logged verbatim, so those log lines span several lines
+     (`body:`/`trace:` continuations). Only
+     `staggered-dispatch.sh` itself reads the markers, so nothing else has to
+     change — but grep/parse the log by record, not by line.
+
+   Status: no current producer emits a newline — `rate_limit_gate.py` builds
+   every reason from single-line f-strings (no `join`/`\n` in the file, and
+   the live gate file is single-line), so this rule is defense-in-depth for
+   manual writes, future producers, and alternate gate writers.
 4. **A malformed helper line fails open.** The inline helper always prints
    exactly four US-joined fields; if fewer than three US delimiters arrive,
    the output is treated as unparseable (dispatch proceeds, no markers) —
@@ -153,7 +176,7 @@ marker management and dispatch) — safe to call manually.
 
 ## Tests
 
-`bash tests/test_staggered_dispatch.sh` — 20 integration legs, 79
+`bash tests/test_staggered_dispatch.sh` — 21 integration legs, 89
 assertions: pause writes markers + skips dispatch (stub + real CLI, with a
 claimable `ready` task left untouched so "no claim" is not vacuous), 429 /
 QUOTA-WINDOW / KALMAN classified, unknown reason → no markers, auto-resume
@@ -168,12 +191,13 @@ shift fields, an empty `resume_at` (null — what the gate emits) does not
 shift fields either, a decoded `\n` inside the reason is not truncated
 (`t17`), a multi-line reason with a null `resume_at` keeps both fields
 (`t18`), a literal US (the delimiter itself) inside the reason is data
-(`t19`), and a multi-line reason reaches the 2 h manager-alert text AND the
+(`t19`), a multi-line reason reaches the 2 h manager-alert text AND the
 marker intact (`t20`) — the alert renders the reason verbatim, so it was
-truncated pre-fix too. Legs are hermetic (no leg can spawn a real worker):
-stub-hermes
-asserts orchestration, `--sweep` and paused full-runs use the real CLI with a
-`HERMES_KANBAN_DB` pin.
+truncated pre-fix too — and a multi-line reason survives the marker
+round-trip over TWO passes: the 2 h alert still fires exactly once and the
+canary state/episode start are preserved (`t21`). Legs are hermetic (no leg
+can spawn a real worker): stub-hermes asserts orchestration, `--sweep` and
+paused full-runs use the real CLI with a `HERMES_KANBAN_DB` pin.
 
 Implementation notes for operators:
 

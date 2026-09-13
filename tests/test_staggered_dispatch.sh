@@ -442,6 +442,39 @@ t20_multiline_reason_survives_in_2h_alert() {
     assert_eq "$(count_stub_calls 'dispatch')" "0" "t20: still no dispatch under pause"
 }
 
+t21_multiline_reason_survives_two_pass_marker_round_trip() {
+    # Gate 2.5 cold review (kimi-family, t_8cb408e7) major: the fix makes a
+    # multi-line reason reach the marker for the first time, so the marker
+    # READ-BACK path must be newline-safe too — if the record after `reason`
+    # came back empty on the next pass, alerted_2h would reset to False and
+    # re-alert every dispatcher pass (manager alert spam for the whole
+    # episode) and the canary state would be lost. The production marker is
+    # JSON (`json.dump` / `json.load`: staggered-dispatch.sh:251-254, :218-220),
+    # so a newline is escaped on write and decoded on read. This leg pins that
+    # property end-to-end across TWO passes with a raw multi-line reason.
+    new_env
+    write_gate true '"2026-08-15T12:00:00+00:00"' \
+        'zai-503-outage: 3 upstream 5xx in 600s\nbody: upstream returned 503 (retry-after 30s)'
+    local expected=$'zai-503-outage: 3 upstream 5xx in 600s\nbody: upstream returned 503 (retry-after 30s)'
+    fabricate_marker alpha 7300          # already past the 2h alert threshold
+    # --- pass 1: alert fires, the multi-line reason is written to the marker
+    run_dispatch
+    assert_eq "$(printf '%s\n' "$OUT" | grep -c '^ALERT ' || true)" "1" "t21: pass 1 raised exactly one alert"
+    assert_eq "$(marker_field alpha alerted_2h)" "True" "t21: alerted_2h committed with a multi-line reason"
+    assert_eq "$(marker_field alpha reason)" "$expected" "t21: pass 1 marker reason is the full multi-line text"
+    local paused_first
+    paused_first="$(marker_field alpha paused_at_epoch)"
+    # --- pass 2: the multi-line marker is READ BACK; nothing re-fires --------
+    run_dispatch
+    assert_eq "$(printf '%s\n' "$OUT" | grep -c '^ALERT ' || true)" "0" "t21: alert NOT repeated on pass 2 (multi-line reason did not reset alerted_2h)"
+    assert_eq "$(printf '%s\n' "$OUT" | grep -c '^CANARY ' || true)" "0" "t21: canary did not fire (age 7300s < 6h)"
+    assert_eq "$(marker_field alpha alerted_2h)" "True" "t21: alerted_2h survives the multi-line round-trip"
+    assert_eq "$(marker_field alpha canary_count)" "0" "t21: canary_count readable after a multi-line reason"
+    assert_eq "$(marker_field alpha paused_at_epoch)" "$paused_first" "t21: episode start preserved across passes"
+    assert_eq "$(marker_field alpha reason)" "$expected" "t21: pass 2 marker reason still the full multi-line text"
+    assert_eq "$(count_stub_calls 'dispatch')" "0" "t21: still no dispatch under pause"
+}
+
 # ---------- run ----------
 echo "== T3.2 staggered-dispatch integration tests =="
 TEST_FILTER="${TESTS:-}"
