@@ -43,7 +43,7 @@ Cross-artifact contract (must stay in sync with the dispatcher side):
 |---|---|---|
 | block-reason prefix `quota-paused:` matched by `reason.startswith("quota-paused:")` | `staggered-dispatch.sh` (T3.2 sweeper, `docs/board-pause.md`) | quoted verbatim in the skill text; test leg t8/t9 asserts the literal |
 | gate file `~/.hermes/state/rate_limit_gate.json` with `paused` / `reason` / `resume_at` | `rate_limit_gate.py`, `docs/rate_limit_gate.md` (T3.1) | documented + a copy-pasteable read command |
-| quota-class reason prefixes `zai-503-outage:` / `ACTIVE 429:` / `QUOTA-WINDOW:` / `KALMAN:` | `docs/board-pause.md` (`QUOTA_REASON_PREFIXES`) | all four listed |
+| quota-class sweeper prefix tokens `zai-` / `ACTIVE 429` / `QUOTA-WINDOW` / `KALMAN` (no trailing colon; as emitted reason tags they read `zai-503-outage:` / `ACTIVE 429:` / `QUOTA-WINDOW:` / `KALMAN:`) | `staggered-dispatch.sh` (`QUOTA_REASON_PREFIXES`), `docs/board-pause.md` | all four listed, with the token form and the emitted form distinguished |
 | 6 h canary + board-pause markers + free respawn after sweep | `docs/board-pause.md` | summarised in "what happens next" |
 
 **Spec deviation, declared:** the T3.3 spec text phrases the gate condition as
@@ -206,6 +206,7 @@ cp <copy> "$W/skills/devops/kanban-worker/SKILL.md"
 | prompt | diff + task description + Gate-2 test output only; zero design context |
 | verdict | **CHANGES_REQUESTED** — 1 major, 4 minor |
 | verdict file | `~/.hermes/kanban/boards/hermes-for-friends/attachments/t_87e5657d/kimi-t33-verdict.json` |
+| cycle-2 verdict | **APPROVED** at `606728b` — all five findings confirmed fixed in the diff and covered by new non-vacuous legs (t12/t19/t20); no live skill copy mutated; contract strings verbatim-correct. One residual *cosmetic* nit in the cross-artifact table above, actioned in the commit after the approval (docs-only wording, the reviewer's own suggested phrasing). Verdict: `…/kimi-t33-rereview.json`. |
 
 All five findings were addressed before re-review:
 
