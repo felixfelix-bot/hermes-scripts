@@ -374,7 +374,7 @@ t17_newline_in_reason_does_not_truncate() {
     # pre-existing): a JSON \n inside the gate reason decodes to a REAL
     # newline. `read` (herestring, TAB- or US-IFS) stops at the first
     # newline, so GATE_REASON was truncated there — the board-pause marker
-    # and the 2h/6h manager alerts lost everything after line 1. The fields
+    # and the 2h manager alert lost everything after line 1. The fields
     # are now split on US by parameter expansion (no line-based read), so a
     # multi-line reason survives intact.
     # The gate file must carry the escaped form backslash-n (a raw newline is
@@ -427,9 +427,11 @@ t19_literal_us_in_reason_does_not_shift_fields() {
 
 t20_multiline_reason_survives_in_2h_alert() {
     # the finding's operator-visible impact is not only the marker file: the
-    # 2h manager alert (and the 6h canary alert) render the gate reason into
-    # the alert text. Pre-fix, that text was truncated at the first newline
-    # too — the operator saw a stack trace / body cut mid-sentence.
+    # 2h manager alert (handle_quota_pause ALERT2H) renders the gate reason
+    # into the alert text. Pre-fix, that text was truncated at the first
+    # newline too — the operator saw a stack trace / body cut mid-sentence.
+    # (The 6h CANARY alert does NOT carry the reason — it names only the age —
+    # so the marker + the 2h alert + the log line are the whole blast radius.)
     new_env
     write_gate true '"2026-08-15T12:00:00+00:00"' \
         'zai-503-outage: 3 upstream 5xx in 600s\nbody: upstream returned 503 (retry-after 30s)'

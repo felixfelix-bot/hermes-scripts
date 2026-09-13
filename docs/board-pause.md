@@ -49,7 +49,8 @@ drift:
    (nor any `read` without an explicit non-newline `-d`): `read` stops at the
    first NEWLINE, so a `reason` carrying a decoded JSON `\n` — multi-line
    upstream error bodies, joined stack traces — was **truncated at that
-   newline** in the board-pause marker and in the 2h/6h manager alerts.
+   newline** in the board-pause marker and in the 2h manager alert (the 6h
+   canary alert carries only the age, not the reason).
    `reason` is *data*: newlines inside it are ordinary bytes. The current
    split uses parameter expansion on US (`${rest%%$'\x1f'*}` /
    `${rest#*$'\x1f'}`), which cannot stop early and still preserves empty

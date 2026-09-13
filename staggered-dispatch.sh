@@ -143,8 +143,9 @@ PY
     # Newline-proof split (kimi cold review finding #8, pre-existing): a
     # `read ... <<<"$parsed"` stops at the first NEWLINE, so a reason carrying
     # a decoded JSON \n (multi-line upstream bodies / stack traces) was
-    # truncated at that newline in the board-pause marker and in the 2h/6h
-    # manager alerts. Parameter expansion on US treats newlines as ordinary
+    # truncated at that newline in the board-pause marker and in the 2h
+    # manager alert (the 6h canary alert carries only the age, not the reason).
+    # Parameter expansion on US treats newlines as ordinary
     # bytes: it cannot stop early, and it keeps empty fields (0x1f is not
     # whitespace). GATE_REASON takes the whole remainder, so a literal US
     # inside the reason is still harmless.
