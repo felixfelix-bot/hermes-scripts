@@ -122,9 +122,14 @@ paused = bool(g.get("paused")) or bool(g.get("blocked")) or bool(g.get("tripped"
     or (g.get("dispatch_allowed") is False)
 prefixes = [p for p in sys.argv[2].split(":") if p]
 quota = any(reason.startswith(p) for p in prefixes)
-# reason goes LAST so a literal tab inside it can't shift fields —
-# `read -r a b c d` folds everything remaining into the final variable.
-print(f"{1 if paused else 0}\t{1 if quota else 0}\t{resume}\t{reason}")
+# Fields are joined with US (0x1f), NOT a tab: bash treats tab as IFS
+# whitespace, so an EMPTY field (resume_at=null) collapses and every later
+# field shifts left — the reason landed in GATE_RESUME_AT and GATE_REASON came
+# back empty (found by the T3.2 cross-family review, fixed here). 0x1f is a
+# non-whitespace delimiter, so empty fields are preserved. reason still goes
+# LAST so a literal US inside it can't shift fields — `read -r a b c d` folds
+# everything remaining into the final variable.
+print(f"{1 if paused else 0}\x1f{1 if quota else 0}\x1f{resume}\x1f{reason}")
 PY
 )
     if [ -z "$parsed" ]; then
@@ -132,7 +137,7 @@ PY
         return 0
     fi
     GATE_KNOWN=1
-    IFS=$'\t' read -r GATE_PAUSED GATE_QUOTA GATE_RESUME_AT GATE_REASON <<< "$parsed"
+    IFS=$'\x1f' read -r GATE_PAUSED GATE_QUOTA GATE_RESUME_AT GATE_REASON <<< "$parsed"
 }
 
 # Binary gate verdict for the dispatch loop (unchanged contract).
