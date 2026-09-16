@@ -11,6 +11,15 @@ LOG = f"{HOME}/.hermes/logs/urgency-gate.log"
 TIER_CACHE = "/tmp/urgency_tier.json"
 AUTODISPATCH = f"{HOME}/.hermes/config/urgency-autodispatch-boards.txt"
 LEVELS = ("now", "soon", "defer", "batch")
+GATED_VERBS = ("create", "swarm", "promote", "dispatch")
+TRIAGE_TOUCH = f"{HOME}/.hermes/state/urgency-triage.touch"
+
+def touch_triage():
+    """Nudge the urgency-triage classifier (systemd path unit watches this)."""
+    try:
+        os.makedirs(os.path.dirname(TRIAGE_TOUCH), exist_ok=True)
+        with open(TRIAGE_TOUCH, "w") as f: f.write(str(int(time.time())))
+    except Exception: pass
 DEFAULT_SOON_H = 6
 OFFPEAK = set(range(22, 24)) | set(range(0, 6))  # UTC hours
 
@@ -168,6 +177,13 @@ def gate_create(argv):
         lvl = argv[argv.index("--urgency") + 1].lower()
     elif sys.stdin.isatty():
         lvl = tty_ask(argv)
+    elif os.environ.get("HERMES_URGENCY_EXEMPT"):
+        # Exemption used to bypass the gate entirely and leave urgency NULL
+        # (which the dispatcher then parks). Instead stamp the conservative
+        # default so automation never produces unclassified work.
+        lvl = os.environ.get("HERMES_URGENCY_DEFAULT", "soon").strip().lower()
+        if lvl not in LEVELS:
+            lvl = "soon"
     else:
         sys.stderr.write(
             "URGENCY REQUIRED: pass --urgency now|soon|defer|batch "
@@ -179,6 +195,7 @@ def gate_create(argv):
         int(time.time()) + DEFAULT_SOON_H * 3600 if lvl == "soon" else None)
     args = strip_flags(argv, ("--urgency", "--urgency-deadline"))
     board = resolve_board(args)
+    sql(board, migrate)  # ensure the stamp below can't fail open on a new board
     body_i = args.index("--body") + 1 if "--body" in args else None
     if body_i:
         args[body_i] = f"## Urgency: {lvl}\n" + args[body_i]
@@ -239,7 +256,8 @@ def gate_dispatch(argv):
 
 def gate_promote(argv):
     board = resolve_board(argv)
-    ids = [a for a in argv[3:] if a.startswith("t_")]
+    sql(board, migrate)  # close the fail-open hole on un-migrated boards
+    ids = [a for a in argv if a.startswith("t_")]
     ok = sql(board, lambda c: [i for (i,) in c.execute(
         "SELECT id FROM tasks WHERE id IN (%s) AND urgency IS NOT NULL" %
         ",".join("?" * len(ids)), ids)] or [])
@@ -270,7 +288,13 @@ def tick():
                 "WHERE status IN ('ready','scheduled','todo')").fetchall()) or []
             for tid, st, urg, dl, cat in rows:
                 if st == "ready" and urg is None:
+                    def _mark(c, _tid=tid):
+                        c.execute("UPDATE tasks SET urgency_source="
+                                  "'urgency-unclassified' WHERE id=? AND urgency IS NULL",
+                                  (_tid,)); c.commit()
+                    sql(board, _mark)
                     park(board, tid, "urgency-unclassified (tick sweep)")
+                    touch_triage()
                 elif st == "scheduled" and urg is not None and eligible(urg, t["tier"]):
                     kb(board, "unblock", tid, "--reason",
                        f"price window open: urgency={urg} tier={t['tier']}")
@@ -289,7 +313,7 @@ def tick():
             if board in enrolled:
                 n = sql(board, lambda c: c.execute(
                     "SELECT COUNT(*) FROM tasks WHERE status='ready'").fetchone())
-                if n and n[0][0]:
+                if n and n[0]:
                     kb(board, "dispatch", "--max", "1")
         except Exception as e:
             log(f"tick fail-open ({board}): {e}")
@@ -326,11 +350,12 @@ def cmd_set(argv):  # hermes-urgency set <board> <id> <lvl> [--deadline X] [--no
         conn.execute("UPDATE tasks SET urgency=?, urgency_deadline=?, urgency_set_at=?, "
                      "urgency_source='operator' WHERE id=?", (lvl, dl, int(time.time()), tid))
         conn.commit()
-    if sql(board, w) is None: sys.exit("db write failed")
+        return True
+    if sql(board, w) is not True: sys.exit("db write failed")
     t = price_tier()
     r = sql(board, lambda c: c.execute(
         "SELECT status FROM tasks WHERE id=?", (tid,)).fetchone())
-    if r and r[0][0] == "scheduled" and eligible(lvl, t["tier"]):
+    if r and r[0] == "scheduled" and eligible(lvl, t["tier"]):
         kb(board, "unblock", tid, "--reason", f"classified {lvl}; tier={t['tier']} OK")
     log(f"set {tid} @ {board} -> {lvl} (deadline={dl})")
     return 0
@@ -339,10 +364,14 @@ def main():
     a = sys.argv[1:]
     if not a: sys.exit("usage: urgency_gate.py gate|tick|tier|set|park-and-hold ...")
     if a[0] == "gate":
-        sub = a[2] if len(a) > 2 else ""
+        tail = a[2:]
+        verb = next((t for t in tail if t in GATED_VERBS), None)
+        if verb is None or verb == "swarm":
+            os.execv(REAL, [REAL] + a)
+        # Keep the original argument order (global flags like `--board X` must
+        # stay before the verb for the real CLI). Handlers are order-agnostic.
         return {"create": gate_create, "dispatch": gate_dispatch,
-                "promote": gate_promote}.get(sub, lambda av: (
-                    os.execv(REAL, [REAL] + a)))(a[2:])
+                "promote": gate_promote}[verb](tail)
     if a[0] == "tick": tick(); return 0
     if a[0] == "tier":
         t = price_tier(); print(t["tier"], "-", "; ".join(t["evidence"])); return 0
@@ -354,7 +383,13 @@ def main():
             for tid, urg in (sql(board, lambda c: c.execute(
                     "SELECT id, urgency FROM tasks WHERE status='ready'").fetchall()) or []):
                 if urg is None:
+                    def _mark(c, _tid=tid):
+                        c.execute("UPDATE tasks SET urgency_source="
+                                  "'urgency-unclassified' WHERE id=? AND urgency IS NULL",
+                                  (_tid,)); c.commit()
+                    sql(board, _mark)
                     park(board, tid, "urgency-unclassified (staggered pre-check)")
+                    touch_triage()
                 elif not eligible(urg, t["tier"]):
                     park(board, tid, f"price-hold: urgency={urg} tier={t['tier']}")
         except Exception as e:
