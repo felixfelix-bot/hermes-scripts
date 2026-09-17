@@ -252,7 +252,11 @@ def gate_dispatch(argv):
                      f"tier={t['tier']} ({'; '.join(t['evidence'])})")
     except Exception as e:
         log(f"dispatch-gate fail-open ({board}): {e}")  # never block dispatch on our bugs
-    os.execv(REAL, [REAL] + argv)
+    # `tail` (and therefore argv) has already had BOTH 'gate' and 'kanban'
+    # stripped — the real CLI still needs the 'kanban' token, or argparse sees
+    # '--board X dispatch' at top level and dies with "invalid choice"
+    # (live 2026-09-17: every shimmed dispatch failed this way).
+    os.execv(REAL, [REAL, "kanban"] + argv)
 
 def gate_promote(argv):
     board = resolve_board(argv)
