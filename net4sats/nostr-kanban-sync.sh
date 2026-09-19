@@ -89,4 +89,9 @@ fi
 # Publishes local kanban changes (all boards) to Nostr for the peer machine.
 # Counterpart: nostr-kanban-inbound-sync.sh subscribes and applies changes.
 
-python3 "$SCRIPT_DIR/kanban-nostr-replicate.py" --outbound 2>/dev/null || true
+# Failures are surfaced (log + non-silent stdout) instead of being swallowed:
+# a stderr-swallowed crash here kept the outbound watermark frozen for weeks.
+REPLICATE_LOG=~/.hermes/state/kanban-nostr-sync.log
+if ! python3 "$SCRIPT_DIR/kanban-nostr-replicate.py" --outbound 2>>"$REPLICATE_LOG"; then
+    echo "⚠️ kanban nostr outbound replication FAILED — tail $REPLICATE_LOG"
+fi

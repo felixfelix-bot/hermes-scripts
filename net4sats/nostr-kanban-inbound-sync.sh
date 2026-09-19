@@ -2,7 +2,7 @@
 # nostr-kanban-inbound-sync.sh — Import kanban state from Nostr
 #
 # Two functions:
-#   1. Nostr kanbanstr → human-gate board (kind 30302) from external collaborators
+#   1. Nostr kanbanstr → inbound board (kind 30302) from external collaborators
 #   2. Nostr → ALL boards bidirectional replication (kind 38010) from peer machine
 #
 # Counterpart to nostr-kanban-sync.sh (outbound).
@@ -17,16 +17,16 @@ source ~/nostr-glasses/secrets/.env 2>/dev/null || { echo "No Nostr key configur
 
 BOARD_PUBKEY="e18a1d171a59d874edd336472afeb3a614d3dc83397dd097e922a99dcee02133"
 BOARD_ID="net4sats-human-gate"
-RELAYS="wss://relay.damus.io wss://nos.lol"
+RELAYS="wss://relay.damus.io wss://nos.lol wss://relay.ngit.dev"
 STATE_FILE=~/.hermes/state/nostr-kanban-inbound-sync.json
-LOCAL_DB="/home/c03rad0r/.hermes/kanban/boards/human-gate/kanban.db"
+LOCAL_DB="/home/c03rad0r/.hermes/kanban/boards/inbound/kanban.db"
 
 mkdir -p "$(dirname "$STATE_FILE")"
 
 MY_PUBKEY=$(nak key public "$NOSTR_SECRET_KEY" 2>/dev/null || echo "")
 
 # ════════════════════════════════════════════════════════════════════════════
-# PART 1: Human-gate kanbanstr import (kind 30302) — external collaborators
+# PART 1: Inbound kanbanstr import (kind 30302) — external collaborators
 # ════════════════════════════════════════════════════════════════════════════
 
 # Query kind 30302 events filtered by a-tag = 30301:<pubkey>:<board-id>
@@ -130,7 +130,7 @@ for card in new_cards:
             "INSERT INTO tasks "
             "(id, title, body, assignee, status, priority, "
             " created_by, created_at, workspace_kind) "
-            "VALUES (?, ?, ?, 'human-gate', ?, 5, "
+            "VALUES (?, ?, ?, 'inbound', ?, 5, "
             " 'nostr-sync', ?, 'scratch')",
             (task_id, card["title"], body, card["local_status"], card["created_at"]),
         )
@@ -151,7 +151,7 @@ PYEOF
 
     CREATED=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('created',0))" 2>/dev/null || echo 0)
     if [ "$CREATED" -gt 0 ]; then
-        echo "📥 Imported $CREATED external Nostr card(s) into human-gate board"
+        echo "📥 Imported $CREATED external Nostr card(s) into inbound board"
     fi
 fi
 
@@ -161,4 +161,7 @@ fi
 # Subscribes to kind 38010 events from the peer machine and applies them to
 # the local kanban.db. Counterpart: nostr-kanban-sync.sh publishes outbound.
 
-python3 "$SCRIPT_DIR/kanban-nostr-replicate.py" --inbound 2>/dev/null || true
+REPLICATE_LOG=~/.hermes/state/kanban-nostr-sync.log
+if ! python3 "$SCRIPT_DIR/kanban-nostr-replicate.py" --inbound 2>>"$REPLICATE_LOG"; then
+    echo "⚠️ kanban nostr inbound replication FAILED — tail $REPLICATE_LOG"
+fi
