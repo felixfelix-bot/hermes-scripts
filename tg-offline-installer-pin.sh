@@ -75,19 +75,25 @@ if gh api "repos/${SRC_REPO}/contents/scripts/offline/install-router.sh?ref=${NE
   grep -q 'apk_deps_rc' "${TMP}" \
     && say "  OK: gate reports apk's own rc" \
     || say "  WARNING: honest rc reporting NOT found"
-  # The OLD defective stage-2 filter is identified by its case pattern, not by the
-  # string "REQUIRED_DEPS" -- that name legitimately appears elsewhere (the
-  # bundle-closure audit loop and its gate_pass line), which made an earlier
-  # version of this check warn on a perfectly good pin.
-  if grep -q '"\$dep-"\*' "${TMP}"; then
-    say "  WARNING: the OLD named-deps filter is still present (case \"\$dep-\"*) -- pin may be wrong"
+  # The defective filter and the legitimate bundle-closure audit are textually
+  # similar (both walk REQUIRED_DEPS with a "$dep-"* case pattern), so text
+  # matching anywhere in the file cannot tell them apart. Scope the check to the
+  # dependency-INSTALL stage itself: from the "(2) dependency packages" banner to
+  # its gate_pass line.
+  awk '/\(2\) dependency packages/{f=1} f{print} /gate_pass deps_installed/{f=0}' "${TMP}" > "${TMP}.stage2"
+  if [ -s "${TMP}.stage2" ]; then
+    say "  stage (2) region: $(wc -l < "${TMP}.stage2") lines"
+    grep -q 'for f in \$STAGED_APKS' "${TMP}.stage2" \
+      && say "  OK: stage (2) iterates the whole staged closure" \
+      || say "  WARNING: stage (2) does not iterate the staged closure"
+    if grep -q '"\$dep-"\*' "${TMP}.stage2"; then
+      say "  WARNING: the OLD named-deps filter is still in stage (2) -- pin may be wrong"
+    else
+      say "  OK: the old named-deps filter is gone from stage (2)"
+    fi
   else
-    say "  OK: the old named-deps filter is gone (note: 'for dep in \$REQUIRED_DEPS'"
-    say "      elsewhere in the file is the bundle-closure audit, not the defective stage)"
+    say "  WARNING: could not locate stage (2) in the pinned file -- inspect by hand"
   fi
-  grep -q 'for f in \$STAGED_APKS' "${TMP}" \
-    && say "  OK: stage (2) iterates the whole staged closure" \
-    || say "  WARNING: stage (2) does not iterate the staged closure"
 else
   say "  could not fetch the file at that ref (network or permission) — verify by hand"
 fi
