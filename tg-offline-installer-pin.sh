@@ -75,11 +75,19 @@ if gh api "repos/${SRC_REPO}/contents/scripts/offline/install-router.sh?ref=${NE
   grep -q 'apk_deps_rc' "${TMP}" \
     && say "  OK: gate reports apk's own rc" \
     || say "  WARNING: honest rc reporting NOT found"
-  if grep -q 'for dep in \$REQUIRED_DEPS' "${TMP}"; then
-    say "  WARNING: the OLD named-deps filter is still present — pin may be wrong"
+  # The OLD defective stage-2 filter is identified by its case pattern, not by the
+  # string "REQUIRED_DEPS" -- that name legitimately appears elsewhere (the
+  # bundle-closure audit loop and its gate_pass line), which made an earlier
+  # version of this check warn on a perfectly good pin.
+  if grep -q '"\$dep-"\*' "${TMP}"; then
+    say "  WARNING: the OLD named-deps filter is still present (case \"\$dep-\"*) -- pin may be wrong"
   else
-    say "  OK: the old named-deps filter is gone"
+    say "  OK: the old named-deps filter is gone (note: 'for dep in \$REQUIRED_DEPS'"
+    say "      elsewhere in the file is the bundle-closure audit, not the defective stage)"
   fi
+  grep -q 'for f in \$STAGED_APKS' "${TMP}" \
+    && say "  OK: stage (2) iterates the whole staged closure" \
+    || say "  WARNING: stage (2) does not iterate the staged closure"
 else
   say "  could not fetch the file at that ref (network or permission) — verify by hand"
 fi
