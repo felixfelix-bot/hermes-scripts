@@ -37,8 +37,6 @@ try:  # websockets >= 13 exposes the asyncio client under websockets.asyncio
 except ImportError:  # websockets 12.x — legacy client (same connect()/ping_interval API)
     import websockets.client as ws_client
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 # ── Constants ──────────────────────────────────────────────────────────────
 
 NIP_46_KIND = 24133
@@ -71,14 +69,52 @@ def setup_logging(verbose: bool = False) -> None:
     logger.addHandler(fh)
 
 
-# ── Crypto / NIP-44 ────────────────────────────────────────────────────────
-
-# NIP-44 uses AES-256-GCM with a specific key derivation
+# ── Crypto / NIP-44 (v2) ───────────────────────────────────────────────────
+#
+# NIP-44 v2 = ECDH(raw x) → HKDF-extract(salt='nip44-v2') = conversation key;
+# per-message keys = HKDF-expand(PRK=conversation_key, info=nonce, L=76) sliced
+# into chacha_key(32) | chacha_nonce(12) | hmac_key(32); the padded plaintext is
+# ChaCha20-encrypted and authenticated with HMAC-SHA256 over (nonce||ciphertext);
+# payload = 0x02 || nonce || ciphertext || mac, base64.
 # See https://github.com/nostr-protocol/nips/blob/master/44.md
+#
+# NOTE: the previous in-tree implementation was ChaCha20Poly1305 with a key
+# derived as HKDF-expand(info='nip44-v2') and HMAC(chacha_key, nonce). It was
+# self-consistent (its own tests passed) but was NOT NIP-44, so no real client
+# (nak, Amber, nostr-tools) could ever exchange messages with nosigner.
+
+NIP44_V2 = 0x02
+NIP44_MAX_PLAINTEXT = 0xFFFFFFFF
+NIP44_EXTENDED_PREFIX_THRESHOLD = 65536
+
+
+def hkdf_extract(ikm: bytes, salt: bytes) -> bytes:
+    """HKDF-Extract (RFC 5869) with SHA-256."""
+    import hashlib
+    import hmac
+
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    """HKDF-Expand (RFC 5869) with SHA-256."""
+    import hashlib
+    import hmac
+
+    if length < 1 or length > 255 * 32:
+        raise ValueError(f"invalid HKDF length {length}")
+    okm = b""
+    block = b""
+    counter = 1
+    while len(okm) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        okm += block
+        counter += 1
+    return okm[:length]
 
 
 def _hkdf_derive(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
-    """HMAC-based Extract-and-Expand Key Derivation (NIP-44 spec)."""
+    """HMAC-based Extract-and-Expand Key Derivation (generic HKDF helper)."""
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -91,79 +127,130 @@ def _hkdf_derive(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
     return hkdf.derive(ikm)
 
 
+def nip44_calc_padded_len(unpadded_len: int) -> int:
+    """Padded length per NIP-44 v2 (powers-of-two scheme, min 32, min chunk 32)."""
+    if unpadded_len <= 32:
+        return 32
+    next_power = 1 << (unpadded_len - 1).bit_length()  # 2^(floor(log2(n-1)) + 1)
+    chunk = 32 if next_power <= 256 else next_power // 8
+    return chunk * ((unpadded_len - 1) // chunk + 1)
+
+
+def nip44_pad(plaintext: bytes) -> bytes:
+    """UTF-8 bytes → length-prefixed, zero-padded buffer."""
+    n = len(plaintext)
+    if n < 1 or n > NIP44_MAX_PLAINTEXT:
+        raise ValueError(f"invalid plaintext length {n}")
+    if n >= NIP44_EXTENDED_PREFIX_THRESHOLD:
+        prefix = b"\x00\x00" + n.to_bytes(4, "big")  # 6-byte extended prefix
+    else:
+        prefix = n.to_bytes(2, "big")
+    return prefix + plaintext + b"\x00" * (nip44_calc_padded_len(n) - n)
+
+
+def nip44_unpad(padded: bytes) -> bytes:
+    """Inverse of nip44_pad; validates the length prefix and padding size."""
+    if len(padded) < 2:
+        raise ValueError("invalid padding: too short")
+    first_two = int.from_bytes(padded[:2], "big")
+    if first_two == 0:
+        if len(padded) < 6:
+            raise ValueError("invalid padding: truncated extended prefix")
+        unpadded_len = int.from_bytes(padded[2:6], "big")
+        prefix_len = 6
+        if unpadded_len < NIP44_EXTENDED_PREFIX_THRESHOLD:
+            raise ValueError("invalid padding: extended prefix for short payload")
+    else:
+        unpadded_len = first_two
+        prefix_len = 2
+    unpadded = padded[prefix_len : prefix_len + unpadded_len]
+    if (
+        unpadded_len == 0
+        or len(unpadded) != unpadded_len
+        or len(padded) != prefix_len + nip44_calc_padded_len(unpadded_len)
+    ):
+        raise ValueError("invalid padding")
+    return unpadded
+
+
+def _chacha20(key: bytes, nonce12: bytes, data: bytes) -> bytes:
+    """Raw ChaCha20 (RFC 8439) with a 32-bit counter starting at 0.
+
+    cryptography's ChaCha20 wants a 16-byte "nonce": 4-byte little-endian
+    counter followed by the 12-byte RFC 8439 nonce (verified against the
+    RFC 8439 test vector).
+    """
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+
+    if len(nonce12) != 12:
+        raise ValueError(f"chacha nonce must be 12 bytes, got {len(nonce12)}")
+    cipher = Cipher(algorithms.ChaCha20(key, b"\x00\x00\x00\x00" + nonce12), mode=None)
+    ctx = cipher.encryptor()
+    return ctx.update(data) + ctx.finalize()
+
+
+def nip44_get_message_keys(
+    conversation_key: bytes, nonce: bytes
+) -> tuple[bytes, bytes, bytes]:
+    """(chacha_key, chacha_nonce, hmac_key) from conversation key + 32-byte nonce."""
+    if len(conversation_key) != 32:
+        raise ValueError(f"conversation key must be 32 bytes, got {len(conversation_key)}")
+    if len(nonce) != 32:
+        raise ValueError(f"nonce must be 32 bytes, got {len(nonce)}")
+    keys = hkdf_expand(conversation_key, nonce, 76)
+    return keys[0:32], keys[32:44], keys[44:76]
+
+
 def nip44_encrypt(plaintext: str, conversation_key: bytes) -> str:
-    """NIP-44 v2 encrypt. Returns base64 payload."""
+    """NIP-44 v2 encrypt. Returns base64(version || nonce || ciphertext || mac)."""
     import base64
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
-    from cryptography.hazmat.primitives import hashes
-    import hmac as hmac_mod
     import hashlib
+    import hmac
 
-    # NIP-44 v2: derive per-message key
-    # 1. HKDF-Expand(PRK=conversation_key, info="nip44-v2", L=32)
-    hkdf_expand = HKDFExpand(
-        algorithm=hashes.SHA256(),
-        length=32,
-        info=b"nip44-v2",
-    )
-    chacha_key = hkdf_expand.derive(conversation_key)
-
-    # 2. Generate random nonce (32 bytes)
     nonce = os.urandom(32)
+    chacha_key, chacha_nonce, hmac_key = nip44_get_message_keys(conversation_key, nonce)
 
-    # 3. HMAC-SHA256(chacha_key, nonce) -> actual encryption key
-    h = hmac_mod.new(chacha_key, nonce, hashlib.sha256)
-    enc_key = h.digest()
+    ciphertext = _chacha20(chacha_key, chacha_nonce, nip44_pad(plaintext.encode("utf-8")))
+    mac = hmac.new(hmac_key, nonce + ciphertext, hashlib.sha256).digest()
 
-    # 4. Encrypt with ChaCha20Poly1305, nonce=zero(12)
-    cipher = ChaCha20Poly1305(enc_key)
-    pt_bytes = plaintext.encode("utf-8")
-    ct = cipher.encrypt(b"\x00" * 12, pt_bytes, None)
-
-    # 5. Payload: version(1) + nonce(32) + ciphertext+mac
-    payload = bytes([0x02]) + nonce + ct
-    return base64.b64encode(payload).decode()
+    return base64.b64encode(bytes([NIP44_V2]) + nonce + ciphertext + mac).decode()
 
 
 def nip44_decrypt(ciphertext_b64: str, conversation_key: bytes) -> str:
-    """NIP-44 v2 decrypt. Returns plaintext string."""
+    """NIP-44 v2 decrypt of a base64 payload. Returns plaintext string."""
     import base64
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
-    from cryptography.hazmat.primitives import hashes
-    import hmac as hmac_mod
     import hashlib
+    import hmac
 
-    payload = base64.b64decode(ciphertext_b64)
+    if not ciphertext_b64:
+        raise ValueError("empty NIP-44 payload")
+    if ciphertext_b64[0] == "#":
+        raise ValueError("Unsupported NIP-44 version: non-base64 encoding")
+    if len(ciphertext_b64) < 132:
+        raise ValueError(f"invalid NIP-44 payload size: {len(ciphertext_b64)} chars")
+    try:
+        payload = base64.b64decode(ciphertext_b64)
+    except Exception as e:  # binascii.Error
+        raise ValueError(f"invalid NIP-44 base64: {e}") from e
+    if len(payload) < 99:
+        raise ValueError(f"invalid NIP-44 data size: {len(payload)} bytes")
 
-    # Parse NIP-44 v2 payload: version(1) + nonce(32) + ciphertext+mac(rest)
-    if len(payload) < 1:
-        raise ValueError("Empty payload")
     version = payload[0]
-    if version != 0x02:
+    if version != NIP44_V2:
         raise ValueError(f"Unsupported NIP-44 version: {version}")
 
     nonce = payload[1:33]
-    ct_with_mac = payload[33:]
+    ciphertext = payload[33:-32]
+    mac = payload[-32:]
+    chacha_key, chacha_nonce, hmac_key = nip44_get_message_keys(conversation_key, nonce)
 
-    # Derive per-message key
-    # 1. HKDF-Expand(PRK=conversation_key, info="nip44-v2", L=32)
-    hkdf_expand = HKDFExpand(
-        algorithm=hashes.SHA256(),
-        length=32,
-        info=b"nip44-v2",
-    )
-    chacha_key = hkdf_expand.derive(conversation_key)
+    expected = hmac.new(hmac_key, nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, mac):
+        raise ValueError("invalid MAC for NIP-44 payload")
 
-    # 2. HMAC-SHA256(chacha_key, nonce) -> actual encryption key
-    h = hmac_mod.new(chacha_key, nonce, hashlib.sha256)
-    enc_key = h.digest()
+    padded = _chacha20(chacha_key, chacha_nonce, ciphertext)
+    return nip44_unpad(padded).decode("utf-8")
 
-    # 3. Decrypt with ChaCha20Poly1305, nonce=zero(12)
-    cipher = ChaCha20Poly1305(enc_key)
-    pt = cipher.decrypt(b"\x00" * 12, ct_with_mac, None)
-    return pt.decode("utf-8")
 
 
 def ecdh_shared_x(privkey: bytes, pubkey_xonly: bytes) -> bytes:
@@ -182,19 +269,14 @@ def ecdh_shared_x(privkey: bytes, pubkey_xonly: bytes) -> bytes:
 
 
 def get_conversation_key(privkey: bytes, pubkey_xonly: bytes) -> bytes:
-    """Derive NIP-44 conversation key from private key and remote public key.
+    """Derive the NIP-44 conversation key.
 
-    Uses ECDH (raw x coordinate) then HKDF as specified in NIP-44.
-    The pubkey_xonly is the 32-byte x-only public key (Nostr format).
+    NIP-44: ``conversation_key = HKDF-extract(IKM = shared_x,
+    salt = 'nip44-v2')`` — a plain HKDF-Extract with no info and no expand, so
+    the result is 32 bytes.
     """
-    shared_point = ecdh_shared_x(privkey, pubkey_xonly)
-    # HKDF derivation
-    return _hkdf_derive(
-        ikm=shared_point,
-        salt=b"nip44-v2",
-        info=b"nip44-conversation-key",
-        length=32,
-    )
+    shared_x = ecdh_shared_x(privkey, pubkey_xonly)
+    return hkdf_extract(shared_x, b"nip44-v2")
 
 
 # ── NIP-04 (AES-256-CBC) ───────────────────────────────────────────────────
@@ -1067,6 +1149,8 @@ class BunkerDaemon:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="NIP-46 Remote Signer (Bunker) Daemon")
     parser.add_argument("--sec", help="nsec private key for the signer")
+    parser.add_argument("--sec-file",
+                        help="file with the nsec/hex key (0600); preferred over --sec")
     parser.add_argument("--bunker-url", help="bunker:// URL (parsed for config)")
     parser.add_argument("--daemon", action="store_true", help="Run as persistent daemon")
     parser.add_argument("--one-shot", action="store_true", help="Handle one request then exit")
@@ -1078,6 +1162,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if not args.sec and getattr(args, "sec_file", None):
+        try:
+            with open(args.sec_file) as _fh:
+                args.sec = _fh.read().strip()
+        except OSError as _e:
+            logger.error("Could not read --sec-file: %s", _e)
+            sys.exit(1)
     setup_logging(args.verbose)
 
     privkey: bytes | None = None

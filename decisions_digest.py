@@ -24,12 +24,32 @@ and printed with an ALERT/POST-FAIL marker so the anomaly channel (anomaly-dm-
 digest.sh, block for this job) surfaces it to the operator. Exit is ALWAYS 0:
 this is a `no_agent` cron and a non-zero exit is itself delivered as a failure.
 
+WRITER vs OBSERVER (2026-09-27, task t_a328b9a0): the bridge identity used to be
+hardcoded to *another node's* key path (`~/.hermes/keys/hermes-ops/cobrador.nsec`).
+On every other fleet node — which legitimately does not hold that key — the job
+therefore reported `posted 0/N` plus `ALERT decision-channel-degraded` on every
+single tick: 110 consecutive failures on dq05 that described a *healthy*
+channel and got filed as a relay outage. The identity is now resolved from this
+node's own ops config (`hermes_ops.json` → `node_nsec`), and the node's role is
+derived from the channel's member list:
+
+  writer   this node's pubkey is a channel member → posts, writes state.
+  observer this node's pubkey is NOT a member → never posts, never writes the
+           shared state file (which is sync-replicated between nodes), and never
+           counts a failure. It still probes the relay so a real outage stays
+           visible; a failed probe *is* a real failure.
+  unknown  no channel config or no readable node key → posts nothing and says so
+           (the watchdog alerts once on this state instead of 110 times).
+
+A dead channel and an idle non-writer node are different facts and must not
+look the same in the health file.
+
 Usage:
   decisions_digest.py [--dry-run] [--no-post] [--escalate-hours N]
 
 Env seams (production defaults; used by tests):
   DECISIONS_STATE_FILE, DECISIONS_HEALTH_FILE, DECISIONS_RELAY,
-  DECISIONS_POST_TIMEOUT
+  DECISIONS_POST_TIMEOUT, DECISIONS_NSEC_FILE, DECISIONS_OPS_CFG
 """
 from __future__ import annotations
 
@@ -57,6 +77,13 @@ POST_TIMEOUT = int(os.environ.get("DECISIONS_POST_TIMEOUT", "45"))
 NAK = next((c for c in [os.path.expanduser("~/.local/bin/nak"),
                         "/usr/local/bin/nak", "/usr/bin/nak"]
             if Path(c).exists()), "nak")
+
+# this node's ops config (same file every other fleet script reads)
+OPS_CFG = Path(os.environ.get("DECISIONS_OPS_CFG",
+                              str(HOME / ".hermes/bot/hermes_ops.json")))
+NSEC_OVERRIDE = os.environ.get("DECISIONS_NSEC_FILE") or None
+# pre-2026-09-27 hardcoded identity: cobrador's key, correct on cobrador only
+LEGACY_NSEC = "~/.hermes/keys/hermes-ops/cobrador.nsec"
 
 REASON_KINDS = ("blocked", "block_loop_detected", "dependency_wait")
 OPERATOR_STATUSES = ("blocked", "triage")
@@ -216,6 +243,51 @@ def collect_inbound() -> list[dict]:
     return items
 
 
+REVIEW_DECISIONS = HOME / ".hermes/state/review_decisions.jsonl"
+
+
+def collect_review_decisions() -> list[dict]:
+    """Operator decisions emitted by review_fix_emit (A/B forks from a review).
+
+    These never become block-hung cards: they surface here with their options so
+    the operator can answer, and the responder can promote the fix.
+    """
+    items: list[dict] = []
+    try:
+        lines = REVIEW_DECISIONS.read_text().splitlines()
+    except Exception:
+        return items
+    seen: set[str] = set()
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        track = d.get("track", "?")
+        uniq = f"{d.get('repo')}#{d.get('pr')}:{track}"
+        if uniq in seen:
+            continue
+        seen.add(uniq)
+        opts = d.get("options") or []
+        items.append({
+            "kind": f"review-decision-{track}",
+            "priority": "P1",
+            "board": d.get("board"),
+            "repo": d.get("repo", ""),
+            "pr": d.get("pr"),
+            "title": (d.get("summary") or "")[:100],
+            "url": d.get("review_url", ""),
+            "why": "review finding needs an operator decision",
+            "recommend": " | ".join(opts)[:200] if opts else "decide",
+            "reversible": "no",
+            "options": opts,
+        })
+    return items
+
+
+# ---------------------------------------------------------------------------
+# rendering + posting
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # rendering + posting
 # ---------------------------------------------------------------------------
@@ -246,12 +318,57 @@ def channel() -> dict | None:
         return None
 
 
+def nsec_path() -> Path:
+    """This node's identity file: env → ops config `node_nsec` → legacy path."""
+    if NSEC_OVERRIDE:
+        return Path(os.path.expanduser(NSEC_OVERRIDE))
+    try:
+        p = json.loads(OPS_CFG.read_text()).get("node_nsec")
+    except Exception:
+        p = None
+    return Path(os.path.expanduser(p or LEGACY_NSEC))
+
+
 def _bridge_sec() -> str | None:
     try:
-        return Path(os.path.expanduser(
-            "~/.hermes/keys/hermes-ops/cobrador.nsec")).read_text().strip()
+        return nsec_path().read_text().strip()
     except OSError:
         return None
+
+
+def _pubkey_of(sec: str) -> str:
+    """Derive the hex pubkey for a secret key. Never logs the secret."""
+    try:
+        return subprocess.run([NAK, "key", "public", sec], capture_output=True,
+                              text=True, timeout=15).stdout.strip().lower()
+    except Exception:
+        return ""
+
+
+def channel_role() -> tuple[str, str]:
+    """Return (role, detail) where role is writer | observer | unknown.
+
+    The channel config already lists its members, so membership is decidable
+    locally and offline: a node whose identity is not a member cannot post to a
+    `closed`, `restricted_writes` NIP-29 group, and saying so is not an outage.
+    """
+    cfg = channel()
+    if not cfg:
+        return "unknown", f"no channel config ({CHANNEL_CFG})"
+    members = {str(m).strip().lower() for m in (cfg.get("members") or [])}
+    sec = _bridge_sec()
+    if not sec:
+        return "unknown", f"node nsec unreadable ({nsec_path()})"
+    if not members:
+        return "writer", "channel config lists no members; assuming writer"
+    pub = _pubkey_of(sec).strip().lower()
+    if not pub:
+        return "unknown", "could not derive this node's pubkey"
+    name = cfg.get("name", "channel")
+    if pub in members:
+        return "writer", f"identity {pub[:16]}… is a {name} member"
+    return "observer", (f"identity {pub[:16]}… is not a member of {name} — "
+                        f"this node does not post")
 
 
 def _out_tail(out: str, n: int = 160) -> str:
@@ -314,19 +431,27 @@ def load_health() -> dict:
 
 
 def save_health(now: int, posted: int, total: int, failures: int,
-                last_error: str, probe_state: str) -> tuple[dict, int]:
+                last_error: str, probe_state: str,
+                role: str = "writer") -> tuple[dict, int]:
     h = load_health()
     prev_failures = int(h.get("consecutive_failures", 0) or 0)
-    if failures:
+    if role == "observer":
+        # not this node's job: never inflate the failure counter. An observer
+        # that reported failures is exactly how a healthy channel came to look
+        # dead for 110 consecutive ticks.
+        h["consecutive_failures"] = 0
+        h["last_error"] = ""
+        h.pop("last_failure_at", None)
+    elif failures:
         h["consecutive_failures"] = prev_failures + 1
         h["last_error"] = last_error[:300]
         h["last_failure_at"] = now
     else:
         h["consecutive_failures"] = 0
         h["last_success"] = now
-    h.update(last_attempt=now, posted_last=posted, to_post_last=total,
-             probe=probe_state, relay=RELAY_OVERRIDE or
-             (channel() or {}).get("relay", ""))
+    h.update(role=role, last_attempt=now, posted_last=posted,
+             to_post_last=total, probe=probe_state,
+             relay=RELAY_OVERRIDE or (channel() or {}).get("relay", ""))
     try:
         HEALTH.parent.mkdir(parents=True, exist_ok=True)
         tmp = HEALTH.with_suffix(".json.tmp")
@@ -349,15 +474,44 @@ def main() -> int:
 
     cfg = channel()
     relay = RELAY_OVERRIDE or (cfg or {}).get("relay", "")
+    now = int(time.time())
 
-    items = collect_boards() + collect_prs() + collect_inbound()
+    # ---- role gate: only a channel member may post --------------------------
+    # A node whose identity is not a member of this closed NIP-29 group cannot
+    # deliver, and must not describe that as a channel outage. Observers skip
+    # collection entirely (cheap) and never touch the sync-replicated state file.
+    role, role_detail = channel_role()
+    if role != "writer":
+        log(f"role={role} — {role_detail}")
+        failures = 0
+        last_error = ""
+        probe_state = "n/a"
+        if role == "observer":
+            probe_state, detail = probe(cfg, relay)
+            if probe_state == "down":
+                failures = 1
+                last_error = detail
+                log(f"ALERT relay-down: {relay} probe failed — {detail}")
+        log("posted 0/0 (observer node: not a decisions writer)")
+        h, prev_failures = save_health(now, 0, 0, failures, last_error,
+                                       probe_state, role=role)
+        if failures:
+            log(f"ALERT decision-channel-degraded: {failures} failure(s) this "
+                f"tick at {relay} — consecutive_failures="
+                f"{h.get('consecutive_failures')} last_error={last_error[:120]}")
+        elif prev_failures > 0:
+            log(f"recovered: decision channel OK again after {prev_failures} "
+                f"failing tick(s) (relay={relay}, probe={probe_state})")
+        return 0
 
+    items = (collect_boards() + collect_prs() + collect_inbound()
+
+             + collect_review_decisions())
     try:
         state = json.loads(STATE.read_text())
     except Exception:
         state = {}
     seen: dict[str, dict] = state.get("items", {})
-    now = int(time.time())
 
     # ---- classify (nothing is written yet) ---------------------------------
     queue: list[tuple[str, str, dict]] = []   # (key, text, deferred update)

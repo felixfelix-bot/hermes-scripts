@@ -4,9 +4,16 @@
 # Scope (the DoD): alert on ANY reappearance of a retired credential literal
 #   * anywhere in $HOME that is not a counted residue class      (hard classes)
 #   * in any hermes state.db (raw bytes or row level, incl. FTS)
-#   * on any public ngit head
+#   * on any public ngit head                    (check (d), cred_h5_ngit.sh)
+#   * on any public GitHub tip in scope          (check (f), cred_h5_github.sh)
 # plus the KeePass magic-header sweep, and the host rejection probe (a host that
 # starts ACCEPTING the retired value is a live exposure and always alerts).
+#
+# (f) exists because (d) is ngit-only by construction: it enumerates kind-30617
+# announcements and reads refs over nostr://, so a literal in the tip tree of a
+# GitHub-hosted public repo is invisible to it (t_f4316ea7 / CRED-H6b: that is
+# how felixfelix-bot/hermes-scripts carried the retired vault-master literal
+# through three sweeps until t_f17fbda0 landed 85a1087).
 #
 # Silent when clean: no stdout at all, so a no_agent cron tick delivers nothing.
 # One alert block when dirty (stdout), plus a best-effort Signal/chat bridge POST
@@ -21,9 +28,10 @@
 #
 # Usage: cred_h5_watchdog.sh [--policy P] [--state F] [--verbose] [--force]
 #                            [--no-network]
-#   --no-network  skip the public-ngit step. The step is recorded UNKNOWN (a
-#                 skipped step is never reported clean) but a deliberate skip is
-#                 NOT a coverage finding: it does not raise an alert by itself.
+#   --no-network  skip the public-ngit and public-github steps. Each step is
+#                 recorded UNKNOWN (a skipped step is never reported clean) but a
+#                 deliberate skip is NOT a coverage finding: it does not raise an
+#                 alert by itself (the run-437 defect must not regress).
 #   --force       ignore the 7-night repeat suppression
 #   --verbose     print a summary line even when clean (the cron tick does not
 #                 pass this, so a clean tick stays byte-empty)
@@ -70,11 +78,15 @@ if [ "$NET" = 1 ]; then
     bash "$SCRIPTS/cred_h5_ngit.sh" --policy "$POLICY" \
         --json "$EVID/ngit.json" --scratch "$HOME/.hermes/state/cred-h5-ngitscan" \
         > "$EVID/ngit.log" 2>&1; NGIT_RC=$?
+    bash "$SCRIPTS/cred_h5_github.sh" --policy "$POLICY" \
+        --json "$EVID/github.json" --scratch "$HOME/.hermes/state/cred-h5-githubscan" \
+        > "$EVID/github.log" 2>&1; GH_RC=$?
 else
     # Explicit operator/self-test skip. Recorded as UNKNOWN for the STEP verdict (a
     # skipped step must never be reported as clean) but it is NOT a coverage finding
     # and must not by itself raise an alert - the summary is told via $NET.
     NGIT_RC=3; echo "skipped (--no-network): not a coverage finding" > "$EVID/ngit.log"
+    GH_RC=3;   echo "skipped (--no-network): not a coverage finding" > "$EVID/github.log"
 fi
 # Host probe: a host accepting the retired value always alerts; an unreachable
 # host is recorded but does not by itself wake a human (documented tolerance).
@@ -82,10 +94,11 @@ python3 "$SCRIPTS/cred_h5_hosts.py" --policy "$POLICY" \
     --json "$EVID/hosts.json" > "$EVID/hosts.log" 2>&1; HOSTS_RC=$?
 
 # ------------------------------------------------------------------ summary
-SUMMARY=$(python3 - "$EVID" "$HOME_RC" "$DB_RC" "$KDBX_RC" "$NGIT_RC" "$HOSTS_RC" "$NET" <<'PY'
+SUMMARY=$(python3 - "$EVID" "$HOME_RC" "$DB_RC" "$KDBX_RC" "$NGIT_RC" "$GH_RC" "$HOSTS_RC" "$NET" <<'PY'
 import json, os, sys
-evid, home_rc, db_rc, kdbx_rc, ngit_rc, hosts_rc = sys.argv[1], *map(int, sys.argv[2:7])
-net = sys.argv[7] == "1"
+evid = sys.argv[1]
+home_rc, db_rc, kdbx_rc, ngit_rc, gh_rc, hosts_rc = map(int, sys.argv[2:8])
+net = sys.argv[8] == "1"
 lines = []
 
 def load(name):
@@ -103,6 +116,7 @@ hard_classes = {k: v for k, v in (h.get("classes") or {}).items()
 over = h.get("residue_over_ceiling") or []
 d = load("dbs.json")
 ng = load("ngit.json")
+ghp = load("github.json")
 hosts = load("hosts.json")
 
 if home_rc == 1:
@@ -133,6 +147,25 @@ elif ngit_rc == 3:
 elif ngit_rc >= 2:
     lines.append(f"NGIT: scan did not run (rc={ngit_rc})")
 
+# check (f): the GitHub-side tip-tree sweep. rc=3 on a REAL run means coverage was
+# incomplete (unreadable repo / deadline / truncation / empty scope) and MUST alert:
+# a sweep that did not finish looking is not a clean sweep (t_f4316ea7). A deliberate
+# --no-network skip (net == 0) is not a finding and stays silent.
+if gh_rc == 1:
+    for f in (ghp.get("findings") or []):
+        if f.get("kind") == "FINDING":
+            lines.append(f"GITHUB: {f['repo']} {f['detail']}")
+elif gh_rc == 3:
+    if net:
+        cov = ghp.get("coverage") or {}
+        lines.append("GITHUB: coverage UNKNOWN "
+                     f"(repos_in_scope={ghp.get('repos', '?')} checked={ghp.get('checked', '?')} "
+                     f"unreadable={ghp.get('unreadable', '?')} not_reached={cov.get('not_reached', '?')} "
+                     f"deadline_hit={cov.get('deadline_hit', '?')} "
+                     f"owner_enumeration_failed={cov.get('owner_enumeration_failed', '?')})")
+elif gh_rc >= 2:
+    lines.append(f"GITHUB: scan did not run (rc={gh_rc})")
+
 if kdbx_rc == 1:
     lines.append("KDBX: KeePass magic header present in a repository (see kdbx.log)")
 elif kdbx_rc >= 2:
@@ -152,7 +185,27 @@ PY
 if [ -z "$SUMMARY" ]; then
     if [ "$VERBOSE" = 1 ]; then
         echo "CRED-H5 watchdog: clean — hard=0, residue within ceilings, state.db clean, kdbx clean, no host accepting the retired value"
-        [ "$NET" = 0 ] && echo "  (ngit step skipped by --no-network: not assessed in this run)"
+        [ "$NET" = 0 ] && echo "  (ngit + github steps skipped by --no-network: not assessed in this run)"
+        # coverage is DECLARED, not implied: print what each network step actually
+        # looked at, so "clean" is never a statement about an empty scan
+        python3 - "$EVID" <<'PY'
+import json, os, sys
+evid = sys.argv[1]
+for label, fn in (("ngit", "ngit.json"), ("github", "github.json")):
+    try:
+        d = json.load(open(os.path.join(evid, fn)))
+    except Exception:
+        continue
+    if label == "ngit":
+        print(f"  {label} coverage: repos={d.get('repos','?')} dirty_repos={d.get('dirty_repos','?')} "
+              f"unreadable={d.get('unreadable','?')}")
+    else:
+        c = d.get("coverage") or {}
+        print(f"  {label} coverage: repos_in_scope={d.get('repos','?')} checked={d.get('checked','?')} "
+              f"unreadable={d.get('unreadable','?')} refs={d.get('refs','?')} "
+              f"owner_publics={c.get('owner_publics','?')} excluded_no_clone={c.get('excluded_no_clone','?')} "
+              f"scratch_mb={c.get('scratch_mb','?')}")
+PY
         echo "evidence: $EVID"
         [ "$HOME_RC" -eq 2 ] && echo "note: home scan rc=2"
     fi
