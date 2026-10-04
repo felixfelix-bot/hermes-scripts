@@ -62,6 +62,12 @@ ESTOP = HERMES / "ESTOP"                       # canonical freeze sentinel (agen
 DISPATCH_FROZEN = BOT / ".dispatch_frozen"     # legacy flag (staggered-dispatch.sh)
 QUARANTINE = BOT / ".fleet_quarantine"          # Phase-H hard hold (no auto-resume until healthy)
 OPERATOR_HOLD = BOT / ".spend_hold"            # operator hold: never auto-unfreeze while present
+# Operator budget override: acknowledging a one-off pre-fix burn (e.g. the
+# 2026-10-03 incident) so it does not wedge the rest of the day. JSON
+# {"max_usd": <float>, "expires": "YYYY-MM-DD", "note": "..."}. Expired or
+# malformed => the constant cap applies. This RAISES the day's ceiling; it does
+# not disable the cap.
+DAILY_BUDGET_OVERRIDE = BOT / ".daily_budget_override.json"
 USAGE_DB = BOT / "zai_usage.db"
 CONFIG = HERMES / "config.yaml"
 
@@ -266,14 +272,32 @@ def _check_burn(conn):
     return (breached, detail)
 
 
+def _daily_spend_max() -> float:
+    """Effective daily ceiling: unexpired operator override, else the constant.
+
+    Lets the operator RAISE the day's ceiling to acknowledge a one-off pre-fix
+    burn without disabling the cap. Malformed/expired override => constant.
+    """
+    try:
+        d = json.loads(DAILY_BUDGET_OVERRIDE.read_text())
+        exp = d.get("expires")
+        if exp and datetime.now().strftime("%Y-%m-%d") > str(exp):
+            return float(BURN_DAILY_SPEND_MAX)
+        return float(d.get("max_usd", BURN_DAILY_SPEND_MAX))
+    except Exception:
+        return float(BURN_DAILY_SPEND_MAX)
+
+
 def _check_daily_spend(conn):
     """Return (breached, detail) for the hard daily spend ceiling.
 
     2026-10-03: a slow steady burn below the hourly cap still drained a topped-up
     paid lane over a day ($20-55/day booked). This catches the cumulative case.
     Uses the daily_spend rollup; a missing/stale table is a no-op (never wedges).
+    The ceiling is the operator override when present (see _daily_spend_max).
     """
-    if conn is None or BURN_DAILY_SPEND_MAX <= 0:
+    cap = _daily_spend_max()
+    if conn is None or cap <= 0:
         return (False, "no usage db")
     today = datetime.now().strftime("%Y-%m-%d")
     try:
@@ -286,8 +310,8 @@ def _check_daily_spend(conn):
         return (False, f"daily query error: {exc}")
     spent = float(row["s"] or 0.0)
     n = int(row["n"] or 0)
-    detail = f"today ${spent:.2f} over {n} calls (cap ${BURN_DAILY_SPEND_MAX:.0f})"
-    return (spent > BURN_DAILY_SPEND_MAX, detail)
+    detail = f"today ${spent:.2f} over {n} calls (cap ${cap:.0f})"
+    return (spent > cap, detail)
 
 
 def _check_runaway(max_in_progress):

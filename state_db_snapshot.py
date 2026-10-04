@@ -35,15 +35,8 @@ BOT = HERMES / "bot"
 RESULT = BOT / "state_db_snapshot.json"
 POLICY = BOT / "state_db_guard.json"
 
-# Retention budget: a manager state.db is ~271 MB, so KEEP_RECENT=96 costs
-# ~26 GB of steady-state disk per rolling profile (plus one snapshot per day for
-# DAILY_KEEP days). On 2026-09-29 that churn took a 233 GB disk to 96% full and
-# the resulting disk pressure surfaced as `sqlite3.OperationalError: disk I/O
-# error` in `PRAGMA journal_mode=WAL` (async_delegation's schema init) - i.e.
-# agent delegation started failing. 24 recent (~6 h at 15-min cadence) plus 7
-# daily snapshots is the same recovery shape at a quarter of the disk.
-KEEP_RECENT = int(os.environ.get("STATE_DB_SNAPSHOT_KEEP_RECENT", "24"))
-DAILY_KEEP = int(os.environ.get("STATE_DB_SNAPSHOT_DAILY_KEEP", "7"))
+KEEP_RECENT = int(os.environ.get("STATE_DB_SNAPSHOT_KEEP_RECENT", "96"))
+DAILY_KEEP = int(os.environ.get("STATE_DB_SNAPSHOT_DAILY_KEEP", "14"))
 STAGGER_S = float(os.environ.get("STATE_DB_SNAPSHOT_STAGGER_S", "2"))
 MIN_SNAPSHOT_BYTES = int(os.environ.get("STATE_DB_SNAPSHOT_MIN_BYTES", "1"))
 

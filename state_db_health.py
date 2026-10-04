@@ -54,6 +54,11 @@ TOTAL_BUDGET_S = int(os.environ.get("STATE_DB_PROBE_BUDGET_S", 300))
 # (a backup blocked on a busy/locked source) can never hang the probe. The
 # budget covers the sum; this covers any single DB.
 PER_DB_TIMEOUT_S = int(os.environ.get("STATE_DB_PER_DB_TIMEOUT_S", 150))
+# A hard per-DB timeout SIGKILLs the child, so its own cleanup cannot run. The
+# parent therefore owns the snapshot temp path (passed via --tmp) and sweeps any
+# leftover `.state_db_health-*` older than this many seconds. Without this the
+# 2026-10 state-db incident leaked ~120 GiB of multi-GB snapshots on dq05.
+STALE_TEMP_MAX_AGE_S = int(os.environ.get("STATE_DB_STALE_TEMP_MAX_AGE_S", 900))
 
 POLICY = BOT / "state_db_guard.json"
 # Long-lived profiles worth the per-tick quick_check scan by default. A node's
@@ -148,7 +153,30 @@ def verdict_from_rows(rows: list[str]) -> tuple[str, str]:
     return "corrupted", "; ".join(rows[:5]) or "quick_check returned no rows"
 
 
-def classify_db(path: Path, threshold: int | None = None) -> dict:
+def _sweep_stale_temp(directory: Path, age_s: int = STALE_TEMP_MAX_AGE_S) -> int:
+    """Remove orphaned `.state_db_health-*` snapshots older than ``age_s``.
+
+    A SIGKILLed per-DB child cannot clean up after itself, so its multi-GB
+    snapshot temp files linger. Sweeping here bounds the leak. Returns the count
+    removed (best-effort; never raises).
+    """
+    removed = 0
+    cutoff = time.time() - age_s
+    try:
+        for leftover in directory.glob(".state_db_health-*"):
+            try:
+                if leftover.stat().st_mtime < cutoff:
+                    leftover.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return removed
+
+
+def classify_db(path: Path, threshold: int | None = None,
+                tmp_path: Path | None = None) -> dict:
     """Classify one state.db without mutating it. Returns a result dict."""
     threshold = SNAPSHOT_THRESHOLD_BYTES if threshold is None else threshold
     try:
@@ -167,7 +195,7 @@ def classify_db(path: Path, threshold: int | None = None) -> dict:
             verdict, detail = "corrupted", f"open failed: {exc}"
         via = "live"
     else:
-        tmp = path.parent / f".state_db_health-{os.getpid()}-{int(_ts())}"
+        tmp = tmp_path or path.parent / f".state_db_health-{os.getpid()}-{int(_ts())}"
         try:
             snapshot_db(path, tmp, SNAPSHOT_TIMEOUT_S)
             conn = sqlite3.connect(str(tmp), timeout=5)
@@ -220,9 +248,11 @@ def _classify_isolated(path: Path) -> dict:
     out-of-process and is killed at PER_DB_TIMEOUT_S. Failure/timeout yields
     'unknown', never 'corrupted'.
     """
+    tmp = path.parent / f".state_db_health-{os.getpid()}-{int(_ts())}"
     try:
         proc = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "--check-one", str(path)],
+            [sys.executable, str(Path(__file__).resolve()), "--check-one", str(path),
+             "--tmp", str(tmp)],
             capture_output=True, text=True, timeout=PER_DB_TIMEOUT_S)
         out = (proc.stdout or "").strip().splitlines()
         if proc.returncode == 0 and out:
@@ -236,6 +266,15 @@ def _classify_isolated(path: Path) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"profile": path.parent.name, "path": str(path), "verdict": "unknown",
                 "via": "child", "size": 0, "detail": f"child error: {exc}"}
+    finally:
+        # The child owns its own cleanup, but a hard timeout SIGKILLs it — so the
+        # parent removes the snapshot it named, and sweeps older orphans too.
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(str(tmp) + suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
+        _sweep_stale_temp(path.parent)
 
 
 def run(profile: str | None = None) -> dict:
@@ -296,9 +335,13 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--profile", default=None)
     ap.add_argument("--check-one", default=None, metavar="PATH",
                     help="classify a single DB and print one JSON line (internal)")
+    ap.add_argument("--tmp", default=None, metavar="PATH",
+                    help="parent-owned snapshot temp path (internal)")
     args = ap.parse_args(argv)
     if args.check_one:
-        print(json.dumps(classify_db(Path(args.check_one)), ensure_ascii=False))
+        print(json.dumps(classify_db(Path(args.check_one),
+                                     tmp_path=Path(args.tmp) if args.tmp else None),
+                         ensure_ascii=False))
         return 0
     result = run(args.profile)
     if args.json:

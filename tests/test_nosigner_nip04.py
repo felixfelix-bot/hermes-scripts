@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Tests for nosigner NIP-04 support (nak's NIP-46 client uses NIP-04, not NIP-44).
+"""Tests for nosigner NIP-04 + NIP-44 support.
+
+nak's NIP-46 client speaks both: it sends NIP-44 v2 payloads (and NIP-04 for
+older paths), so both schemes must interoperate with a real Go implementation.
 
 Coverage:
-  * Real cross-implementation vector produced by `nak encrypt --nip04`
-    (Go implementation) decrypted by nosigner with AES-256-CBC.
-  * nosigner nip04_encrypt output decrypted by `nak decrypt --nip04`.
+  * Real cross-implementation vectors produced by `nak encrypt` (NIP-04 and
+    NIP-44) decrypted by nosigner, and nosigner ciphertexts decrypted by nak.
+  * NIP-44 v2 framing: HKDF-extract conversation key, 76-byte message-key
+    expand, spec padding scheme, ChaCha20 + HMAC-SHA256 (nonce||ciphertext).
   * Raw-x ECDH (NIP-04/NIP-44 secret) vs coincurve's SHA256(compressed) ecdh().
   * Content-format detection (nip04 / nip44 / plain).
+  * BIP-340 schnorr signatures (128 hex chars) for events, not 65-byte ECDSA.
   * Nip46Handler.decrypt_request + _make_response scheme round-trip.
   * End-to-end handler path: NIP-04 encrypted 'connect', then two sign_events
     in a row (regression guard for the "already connected" hang).
@@ -38,6 +43,21 @@ BOB_PUB = "466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27"
 # Produced by: nak encrypt --nip04 -p <BOB_PUB> --sec <ALICE_PRIV> test
 NAK_NIP04_CIPHERTEXT = "ELzzZ4uTaD5932drf7orSg==?iv=SmVCFZi3JVKd1adsq87qRw=="
 NAK_PLAINTEXT = "test"
+
+# Produced by: nak encrypt -p <BOB_PUB> --sec <ALICE_PRIV> 'nip44 cross-impl vector'
+NAK_NIP44_CIPHERTEXT = (
+    "AmPu1lqyirHyfLeMJ3LcBnCncUGGX+PK2EKxqy3oHBeZ2oAI6gbd7XE5kWUOz3TwfCHBmKFi166nIVAXt"
+    "fTkFvC1LjpYLijRRrHPCi8FO9JRCdwY43DPVXN6OIpjPH8o04nQ"
+)
+NAK_NIP44_PLAINTEXT = "nip44 cross-impl vector"
+
+# Produced by: nak encrypt -p <BOB_PUB> --sec <ALICE_PRIV> '["req-9", "sign_event", [{"kind": 1, "content": "x"}]]'
+NAK_NIP44_REQUEST = (
+    "Ag/EUo1lU4qj39LBVh6lMGAfEm2FM2n5X3X2xleRtxEbdlz5zYqJvoCSrQ2U9wYvAUbiTte5bh8hvruj"
+    "WL1IhS1sCIhl/SmoHHtjynpnmnAHBztasfIiEzPf1AuAC/dJiL66tsvN+RRe+L5Q+YkfbH3gzvh1hBZ"
+    "+rl1E0TrelN356l4="
+)
+NAK_NIP44_REQUEST_PAYLOAD = ["req-9", "sign_event", [{"kind": 1, "content": "x"}]]
 
 
 @pytest.fixture()
@@ -106,6 +126,112 @@ def test_nosigner_encrypt_is_readable_by_nak():
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "round trip"
+
+
+# ── NIP-44 v2 (cross-implementation) ───────────────────────────────────────
+
+
+def test_decrypts_real_nak_nip44_ciphertext():
+    """Go (nak) NIP-44 encrypts → nosigner decrypts (was InvalidTag before)."""
+    ck = nosigner.get_conversation_key(BOB_PRIV, bytes.fromhex(ALICE_PUB))
+    assert nosigner.nip44_decrypt(NAK_NIP44_CIPHERTEXT, ck) == NAK_NIP44_PLAINTEXT
+
+
+def test_decrypt_request_real_nak_nip44_ciphertext(handler):
+    parsed, mode = handler.decrypt_request(NAK_NIP44_REQUEST, ALICE_PUB)
+    assert mode == "nip44"
+    assert parsed == NAK_NIP44_REQUEST_PAYLOAD
+
+
+@pytest.mark.skipif(shutil.which("nak") is None, reason="nak not installed")
+def test_nosigner_nip44_is_readable_by_nak():
+    """nosigner NIP-44 encrypts → Go (nak) decrypts."""
+    ck = nosigner.get_conversation_key(BOB_PRIV, bytes.fromhex(ALICE_PUB))
+    ct = nosigner.nip44_encrypt("round trip 44", ck)
+    assert ct[0] == "A"  # base64 of 0x02...
+    out = subprocess.run(
+        ["nak", "decrypt", "-p", BOB_PUB, "--sec", ALICE_PRIV.hex(), ct],
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "round trip 44"
+
+
+def test_nip44_conversation_key_is_hkdf_extract_only():
+    """conversation_key = HKDF-extract(IKM=shared_x, salt='nip44-v2') — no info."""
+    import hashlib
+    import hmac as hmac_mod
+
+    shared_x = nosigner.ecdh_shared_x(BOB_PRIV, bytes.fromhex(ALICE_PUB))
+    expected = hmac_mod.new(b"nip44-v2", shared_x, hashlib.sha256).digest()
+    assert nosigner.get_conversation_key(BOB_PRIV, bytes.fromhex(ALICE_PUB)) == expected
+
+
+def test_nip44_message_keys_split_hkdf_expand_of_nonce():
+    """L=76 expand of the nonce sliced 32|12|32."""
+    ck = nosigner.get_conversation_key(BOB_PRIV, bytes.fromhex(ALICE_PUB))
+    nonce = bytes(range(32))
+    keys = nosigner.hkdf_expand(ck, nonce, 76)
+    assert nosigner.nip44_get_message_keys(ck, nonce) == (
+        keys[0:32],
+        keys[32:44],
+        keys[44:76],
+    )
+
+
+def test_nip44_calc_padded_len_matches_spec_pseudocode():
+    """Reference implementation straight from the NIP-44 spec text."""
+    import math
+
+    def spec_calc(unpadded_len):
+        if unpadded_len <= 32:  # evaluated first: the spec's log2 is undefined at 1
+            return 32
+        next_power = 1 << (math.floor(math.log2(unpadded_len - 1)) + 1)
+        chunk = 32 if next_power <= 256 else next_power / 8
+        return int(chunk * (math.floor((unpadded_len - 1) / chunk) + 1))
+
+    for n in list(range(1, 2100)) + [65535, 65536, 70000]:
+        assert nosigner.nip44_calc_padded_len(n) == spec_calc(n), n
+
+
+def test_nip44_pad_roundtrip_and_payload_framing():
+    ck = nosigner.get_conversation_key(BOB_PRIV, bytes.fromhex(ALICE_PUB))
+    for size in [1, 2, 31, 32, 33, 64, 65, 200, 1000, 70000]:
+        msg = "y" * size
+        ct = nosigner.nip44_encrypt(msg, ck)
+        raw = base64.b64decode(ct)
+        # 0x02 || nonce(32) || ciphertext || mac(32) and ciphertext is padded
+        assert raw[0] == 0x02
+        assert len(raw) == 1 + 32 + len(nosigner.nip44_pad(msg.encode())) + 32
+        assert nosigner.nip44_decrypt(ct, ck) == msg
+        assert nosigner.nip44_unpad(nosigner.nip44_pad(msg.encode())) == msg.encode()
+
+
+def test_nip44_rejects_tampered_ciphertext_and_wrong_key():
+    ck = nosigner.get_conversation_key(BOB_PRIV, bytes.fromhex(ALICE_PUB))
+    other_ck = nosigner.get_conversation_key(
+        bytes.fromhex("33" * 32), bytes.fromhex(ALICE_PUB)
+    )
+    ct = nosigner.nip44_encrypt("tamper me", ck)
+
+    with pytest.raises(ValueError):
+        nosigner.nip44_decrypt(ct, other_ck)
+
+    raw = bytearray(base64.b64decode(ct))
+    raw[-1] ^= 0x01  # flip a MAC bit
+    with pytest.raises(ValueError):
+        nosigner.nip44_decrypt(base64.b64encode(bytes(raw)).decode(), ck)
+
+
+def test_nip44_rejects_short_and_plaintext_payloads():
+    ck = nosigner.get_conversation_key(BOB_PRIV, bytes.fromhex(ALICE_PUB))
+    with pytest.raises(ValueError):
+        nosigner.nip44_decrypt("A" * 100, ck)  # < 132 chars
+    with pytest.raises(ValueError):
+        nosigner.nip44_decrypt("", ck)
+    with pytest.raises(ValueError):
+        nosigner.nip44_decrypt("#future-encoding", ck)
 
 
 def test_nip04_encrypt_decrypt_roundtrip_long_and_unicode():

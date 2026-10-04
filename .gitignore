@@ -3,3 +3,7 @@ __pycache__/
 .coverage
 .pytest_cache/
 !.secret-patterns.txt
+
+# Runtime logs are outputs, not source: they churn every run and one of
+# them (staggered-dispatch.log) had grown to 74k tracked lines.
+*.log

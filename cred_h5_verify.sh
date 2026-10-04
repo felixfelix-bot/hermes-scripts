@@ -9,19 +9,23 @@
 #       plus every hermes state.db (raw bytes + rows)        -> cred_h5_scan.py dbs
 #   (d) 0 hits on every public ngit head                     -> cred_h5_ngit.sh
 #   (e) 0 KeePass magic headers in any repository            -> cred_h5_scan.py kdbx
+#   (f) 0 hits on every in-scope public GitHub ref tip       -> cred_h5_github.sh
+#       (t_f4316ea7 / CRED-H6b: (d) is ngit-only by construction — it enumerates
+#        kind-30617 announcements and reads refs over nostr:// — so a literal in the
+#        tip tree of a GitHub-hosted public repo was invisible to it.)
 #
 # Every step writes its full output to the evidence dir; the console gets a
 # verdict line per step plus the failure detail. No literal value is ever
 # printed (the consumers report rule ids and sha256/12 fingerprints only).
 #
-# Exit: 0 = all five proven clean · 1 = a check FAILED (including a hard-class
+# Exit: 0 = all six proven clean · 1 = a check FAILED (including a hard-class
 #       needle hit, a residue class above its ceiling, a host accepting the
-#       retired value, or a dirty public ngit head) · 3 = no failure but at
+#       retired value, or a dirty public ngit/GitHub tip) · 3 = no failure but at
 #       least one check UNKNOWN/unusable (fail-closed: never reported as clean).
 #
 # Usage: cred_h5_verify.sh [--quick] [--evidence DIR] [--report FILE]
 #                          [--policy P] [--only-hosts a,b]
-#   --quick  skip the public-ngit network step (local checks only)
+#   --quick  skip the public-ngit and public-GitHub network steps (local checks only)
 set -uo pipefail
 
 SCRIPTS="$HOME/.hermes/scripts"

@@ -1,19 +1,61 @@
 {
   "version": 1,
   "default_tier": "code",
-  "_comment": "CHECKED-IN FALLBACK gate spec for gate_engine.py (mirrors ~/.hermes/bot/gates.json as of 2026-09-13). Used only when none of $HERMES_HOME/bot/gates.json, <root>/bot/gates.json or a gates.json next to the engine module parse. Keep in sync with ~/.hermes/bot/gates.json: cp ~/.hermes/bot/gates.json ~/.hermes/scripts/gates.default.json. D-128 tiered gates. code = hard block; docs = advisory. Unknown => code (fail safe). ci_evidence (2026-09-13): the code/risky tier requires a cited live CI result (ngit CI workflow path + conclusion). A documented absence ('no CI evidence available (reason: ...)') is recognised but never a pass, so it cannot satisfy code. The docs/light tier does NOT require ci_evidence.",
+  "enforce_since_ts": 0,
+  "_comment": "D-128 tiered gates. code = hard block; docs/recon = advisory. Unknown => code (fail safe). enforce_since_ts (unix) grandfathers tasks completed/created before it (D-132 addendum); 0 = enforce for all. D-165: a tier name that does not exist in `tiers` is ignored (next source wins, default_tier last) so a typo can never fail open.",
   "tiers": {
     "code": {
       "enforce": "block",
       "coverage_threshold": 80,
-      "require": ["tests_green", "ci_evidence", "cold_cross_family_review", "pushed_or_consolidated"],
-      "review": { "required": true, "cross_family": true }
+      "require": [
+        "tests_green",
+        "ci_evidence",
+        "cold_cross_family_review",
+        "pushed_or_consolidated",
+        "review_artifact",
+        "review_published",
+        "consolidated",
+        "review_benchmark_floor",
+        "secrets_clean",
+        "pr_branch_naming",
+        "no_live_drift",
+        "playbook_check"
+      ],
+      "review": {
+        "required": true,
+        "cross_family": true
+      },
+      "ci_evidence": {
+        "_comment": "D-132: invoke ngit_ci_evidence.py for the exact head; no_results/timeout/nak-missing all block. t_7c503759 (2026-09-22): limit knob threads a nak `-l` to the tool so a busy relay's newest-first window cannot hide a repo's results; server-side `#c` commit filter is primary, this is the fallback depth.",
+        "bin": "",
+        "timeout": 180,
+        "nak_timeout": 120,
+        "limit": 400
+      }
     },
     "docs": {
       "enforce": "advisory",
       "coverage_threshold": 0,
-      "require": ["pushed_or_consolidated"],
-      "review": { "required": false, "cross_family": false }
+      "require": [
+        "pushed_or_consolidated"
+      ],
+      "review": {
+        "required": false,
+        "cross_family": false
+      }
+    },
+    "recon": {
+      "_comment": "D-165: read-only recon / inventory / measurement cards (no repo, no commit, no PR, no CI workflow). Advisory — it can never block a card. Keeps the two checks that ARE meaningful for read-only work: a written review artifact and an independently re-scanned clean secret scan. tests_green/ci_evidence/push are deliberately NOT required because they are structurally impossible for this class of work.",
+      "enforce": "advisory",
+      "coverage_threshold": 0,
+      "require": [
+        "review_artifact",
+        "secrets_clean"
+      ],
+      "review": {
+        "required": false,
+        "cross_family": false
+      }
     }
   },
   "tag_tiers": {
@@ -23,9 +65,16 @@
     "typo": "docs",
     "changelog": "docs",
     "light": "docs",
-    "no-code": "docs"
+    "no-code": "docs",
+    "recon": "recon",
+    "measurement": "recon",
+    "read-only": "recon",
+    "inventory": "recon"
   },
   "board_tiers": {},
+  "task_waivers": {
+    "_comment": "Operator-approved per-task carve-outs. Key = 'board:task' (or bare task). A listed task returns verdict=waived and skips ALL code-tier gates — used only where the deliverable is genuinely done/merged/CI-green but some mandatory gates are structurally unsatisfiable (ci_evidence tooling reads ngit while the repo is GitHub-Actions-routed; pr_branch_naming vs a D-116-mandated non-pr/ branch). Additions require an explicit operator decision; the MANDATORY_CODE_GATES floor holds for every other card."
+  },
   "families": {
     "glm": "zhipu",
     "kimi": "moonshot",
@@ -38,6 +87,9 @@
     "gemini": "google",
     "llama": "meta",
     "mistral": "mistral",
-    "grok": "xai"
+    "grok": "xai",
+    "tencent": "tencent",
+    "hy4": "tencent",
+    "hunyuan": "tencent"
   }
 }

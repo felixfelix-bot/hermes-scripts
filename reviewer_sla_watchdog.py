@@ -35,12 +35,12 @@ STATE / LEDGER (MANDATORY-HARDENED, consultant v3):
   restarts. Per review task id it records:
       {task_id: {"last_alerted": <epoch>, "reassign_count": <int>}}
   reassign_count is the "reviewer-generation" used for dedup against the 4h
-  merge-queue digest: both the watchdog and the digest read/write the SAME
-  shared ledger file, so the dedup key (task_id, reassign_count) lets exactly
-  one actor propose a given generation's reassignment. Cross-process
-  persistence means decisions are made against durable state, never
-  in-memory-only process state. (The digest must read this same state file
-  and skip a task whose reassign_count it already acted on.)
+  merge-queue digest. merge_queue_digest.py is the CONSUMER: it reads the SAME
+  shared ledger file, takes the same advisory flock at <path>.lock, and uses
+  the dedup key (task_id, reassign_count) so that exactly one actor proposes
+  a given generation's reassignment. Cross-process persistence means decisions
+  are made against durable state, never in-memory-only process state. The
+  digest reports watchdog-owned generations but does NOT re-propose them.
 
   Reassignment is capped at --max-reassign per task (default 1). After that the
   task is routed to the MANAGER queue instead (no kimi<->glm ping-pong). Under
