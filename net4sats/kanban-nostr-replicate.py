@@ -28,6 +28,7 @@ Conflict resolution: timestamp-based last-write-wins (per the DQ05 plan, M2d).
 """
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -45,10 +46,17 @@ BOARDS_DIR = os.path.join(HERMES_HOME, "kanban", "boards")
 STATE_DIR = os.path.join(HERMES_HOME, "state")
 
 # Nostr relays — same as existing kanbanstr scripts
-DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://nos.lol"]
+DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.ngit.dev"]
 
 # Event kind for Hermes kanban sync (parameterized replaceable, NIP-33 range)
 KANBAN_KIND = 38010
+
+# Boards that must NEVER be published to public relays (nor overwritten from
+# them). Mirrors EXCLUDE_BOARDS in net4sats_kanbanstr_sync.py — the 2026-09-05
+# client-privacy incident showed an unguarded --all publisher mirrors client
+# boards within minutes. Privacy is a hard requirement, not a knob.
+# See nostr-kanbanstr-board skill: references/client-privacy-board-exclusion.md
+EXCLUDE_BOARDS = {"art-jeff"}
 
 # Logical task columns that define reproducible state.
 # Machine-local runtime columns (worker_pid, claim_lock, current_run_id, etc.)
@@ -110,6 +118,33 @@ def task_hash(row_dict):
     for col in TASK_SYNC_COLUMNS:
         parts.append(str(row_dict.get(col, "")))
     return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:16]
+
+
+def to_epoch(value):
+    """Coerce a timestamp column to an integer epoch second.
+
+    Most boards declare created_at/started_at/completed_at as INTEGER, but the
+    external-card importers (kanbanstr / gsync) write ISO-8601 TEXT into them
+    (e.g. '2026-08-18T13:35:28Z', '2026-08-19 19:42:40'). Mixing str and int in
+    max()/comparisons raised TypeError and aborted the entire sync run, so every
+    timestamp read goes through here. Unparseable values degrade to 0.
+    """
+    if value is None or isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip()
+    if not s:
+        return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        pass
+    iso = s[:-1] + "+00:00" if s[-1] in ("Z", "z") else s
+    try:
+        return int(datetime.datetime.fromisoformat(iso).timestamp())
+    except (ValueError, OSError, OverflowError):
+        return 0
 
 
 def load_state(name):
@@ -185,6 +220,8 @@ def seed():
     seeded = 0
 
     for board in list_boards():
+        if board in EXCLUDE_BOARDS:
+            continue  # never publish privacy-sensitive boards
         db_path = board_db_path(board)
         bstate = state.setdefault(board, {
             "last_event_id": 0,
@@ -239,6 +276,11 @@ def publish_single_task(secret_key, relays, board, task_id):
         print(f"Board '{board}' not found", file=sys.stderr)
         sys.exit(1)
 
+    if board in EXCLUDE_BOARDS:
+        print(f"Refusing to publish excluded (privacy-sensitive) board '{board}'",
+              file=sys.stderr)
+        sys.exit(1)
+
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -254,9 +296,9 @@ def publish_single_task(secret_key, relays, board, task_id):
 
     row_dict = {col: row[col] for col in TASK_SYNC_COLUMNS}
     eff_ts = max(
-        row_dict.get("created_at") or 0,
-        row_dict.get("started_at") or 0,
-        row_dict.get("completed_at") or 0,
+        to_epoch(row_dict.get("created_at")),
+        to_epoch(row_dict.get("started_at")),
+        to_epoch(row_dict.get("completed_at")),
         int(time.time()),
     )
 
@@ -284,6 +326,8 @@ def outbound(secret_key, relays, dry_run=False):
     published = 0
 
     for board in list_boards():
+        if board in EXCLUDE_BOARDS:
+            continue  # never publish privacy-sensitive boards
         db_path = board_db_path(board)
         bstate = state.setdefault(board, {
             "last_event_id": 0,
@@ -336,9 +380,9 @@ def outbound(secret_key, relays, dry_run=False):
 
             # Effective timestamp = max of created_at, completed_at, started_at, now
             eff_ts = max(
-                row_dict.get("created_at") or 0,
-                row_dict.get("started_at") or 0,
-                row_dict.get("completed_at") or 0,
+                to_epoch(row_dict.get("created_at")),
+                to_epoch(row_dict.get("started_at")),
+                to_epoch(row_dict.get("completed_at")),
                 int(time.time()),
             )
 
@@ -381,7 +425,7 @@ def outbound(secret_key, relays, dry_run=False):
                     ["t", cmt["task_id"]],
                     ["src", hn],
                     ["op", "comment"],
-                    ["ts", str(cmt["created_at"])],
+                    ["ts", str(to_epoch(cmt["created_at"]))],
                 ]
                 content = json.dumps({
                     "id": cmt["id"],
@@ -448,11 +492,11 @@ def apply_task_snapshot(board, row_dict, db_path):
 
     if existing:
         # Last-write-wins: compare effective timestamps
-        local_ts = max(existing[0] or 0, existing[1] or 0, existing[2] or 0)
+        local_ts = max(to_epoch(existing[0]), to_epoch(existing[1]), to_epoch(existing[2]))
         remote_ts = max(
-            row_dict.get("created_at") or 0,
-            row_dict.get("started_at") or 0,
-            row_dict.get("completed_at") or 0,
+            to_epoch(row_dict.get("created_at")),
+            to_epoch(row_dict.get("started_at")),
+            to_epoch(row_dict.get("completed_at")),
         )
         if remote_ts <= local_ts:
             conn.close()
@@ -565,6 +609,8 @@ def inbound(secret_key, relays, dry_run=False):
         by_board.setdefault(board, []).append(ev)
 
     for board, evs in by_board.items():
+        if board in EXCLUDE_BOARDS:
+            continue  # never apply relay content into privacy-sensitive boards
         db_path = board_db_path(board)
         if not os.path.isfile(db_path):
             # Board doesn't exist locally — skip (or create?)
@@ -575,10 +621,7 @@ def inbound(secret_key, relays, dry_run=False):
         # Sort by ts for deterministic application
         def get_ts(ev):
             tags = {t[0]: t[1] for t in ev.get("tags", []) if len(t) >= 2}
-            try:
-                return int(tags.get("ts", "0"))
-            except ValueError:
-                return 0
+            return to_epoch(tags.get("ts", 0))
 
         evs.sort(key=get_ts)
 
