@@ -81,9 +81,79 @@ if [[ -z "$_real_hermes" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Passthrough for non-kanban invocations (transparent)
+# Fleet admission cap (OPERATOR 2026-09-11): env override, lowered by an
+# optional throttle file written by fleet_remediate.py (action=throttle).
 # ---------------------------------------------------------------------------
+_FLEET_CAP="${HERMES_FLEET_CAP:-4}"
+_FLEET_CAP_FILE="$HOME/.hermes/bot/.fleet_cap"
+if [[ -f "$_FLEET_CAP_FILE" ]]; then
+    _ffcap="$(grep -oE '"cap"[[:space:]]*:[[:space:]]*[0-9]+' "$_FLEET_CAP_FILE" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+    if [[ -n "${_ffcap:-}" && "$_ffcap" -ge 0 && "$_ffcap" -lt "$_FLEET_CAP" ]]; then
+        _FLEET_CAP="$_ffcap"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Passthrough for non-kanban invocations (transparent), with universal
+# admission (OPERATOR 2026-09-11, H.2) for AUTOMATED worker-profile runs.
+#
+# Cron/script-spawned worker sessions (`hermes -p worker-… chat -q …`) used to
+# bypass the fleet gate entirely. Gate only the non-interactive query form
+# (`-q`/`--query`) so interactive operator runs and non-worker profiles still
+# pass straight through via exec. The reserved slot's PID is preserved across
+# exec, and dead-PID slots are pruned under the lock, so no slot leaks.
+# ---------------------------------------------------------------------------
+_ARGS=("$@")
+_NARGS=${#_ARGS[@]}
+_PROF=""
+_HAS_QUERY=0
+for (( _i=0; _i<_NARGS; _i++ )); do
+    case "${_ARGS[_i]}" in
+        -p|--profile) [[ $((_i+1)) -lt $_NARGS ]] && _PROF="${_ARGS[$((_i+1))]}" ;;
+        -p=*|--profile=*) _PROF="${_ARGS[_i]#*=}" ;;
+        -q|--query) _HAS_QUERY=1 ;;
+    esac
+done
+
 if [[ -z "${HERMES_KANBAN_TASK:-}" ]]; then
+    if [[ "$_PROF" == worker-* && "$_HAS_QUERY" -eq 1 ]]; then
+        _GATE_LOCK="$HOME/.hermes/bot/.fleet_gate.lock"
+        _SLOT_DIR="$HOME/.hermes/bot/.fleet_slots"
+        mkdir -p "$_SLOT_DIR" 2>/dev/null || true
+        _gate_reason=""
+        exec 9>"$_GATE_LOCK" 2>/dev/null || true
+        if [[ -w "$_GATE_LOCK" ]] && flock -w 15 9; then
+            for _sf in "$_SLOT_DIR"/*.slot; do
+                [[ -e "$_sf" ]] || continue
+                _sp="$(basename "$_sf" .slot)"
+                kill -0 "$_sp" 2>/dev/null || rm -f "$_sf"
+            done
+            _live=$(find "$_SLOT_DIR" -maxdepth 1 -name '*.slot' 2>/dev/null | wc -l)
+            if [[ -e "$HOME/.hermes/ESTOP" ]]; then
+                _gate_reason="estop"
+            elif [[ -e "$HOME/.hermes/bot/.dispatch_frozen" ]]; then
+                _gate_reason="dispatch_frozen"
+            elif [[ -e "$HOME/.hermes/bot/.fleet_quarantine" ]]; then
+                _gate_reason="quarantine"
+            elif [[ "${_live:-0}" -ge "$_FLEET_CAP" ]]; then
+                _gate_reason="fleet_cap(${_live}>=${_FLEET_CAP})"
+            else
+                : > "$_SLOT_DIR/$$.slot" 2>/dev/null || true
+            fi
+            flock -u 9
+        else
+            _gate_reason="gate_lock_unavailable"
+        fi
+        exec 9>&- 2>/dev/null || true
+        if [[ -n "$_gate_reason" ]]; then
+            printf '%s GATED profile=%s reason=%s wrapper=%s ppid=%s parent="%s"\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_PROF" "$_gate_reason" "$$" "$PPID" \
+                "$(tr '\0' ' ' < "/proc/${PPID}/cmdline" 2>/dev/null | cut -c1-200)" \
+                >> "$HOME/.hermes/logs/kanban-spawn-audit.log" 2>/dev/null || true
+            echo "FLEET GATE (worker profile): ${_gate_reason} — refusing ${_PROF} run (no spend)." >&2
+            exit 75
+        fi
+    fi
     exec "$_real_hermes" "$@"
 fi
 
@@ -94,6 +164,95 @@ _TASK_ID="$HERMES_KANBAN_TASK"
 _WRAPPER_PID=$$
 _START_EPOCH=$(date +%s)
 _START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+_SPAWN_LOG="$HOME/.hermes/logs/kanban-spawn-audit.log"
+
+# ---------------------------------------------------------------------------
+# Fleet gate (operator 2026-09-11) — bounds EVERY spawn path that resolves
+# through HERMES_BIN, including per-board CLI `kanban dispatch` loops and
+# reclaim/respawn bursts that bypass the embedded dispatcher's global cap.
+# Refuses via EX_TEMPFAIL (75) so the dispatcher releases the task back to
+# `ready` WITHOUT counting a failure (no crash-loop, no token burn).
+#   (a) hard freeze:  ~/.hermes/bot/.dispatch_frozen
+#   (b) live-worker cap: $HERMES_FLEET_CAP (default 4)
+# Also writes a spawner-identity audit line (ppid + parent cmdline) so a
+# future storm is attributable to the mechanism that caused it.
+# ---------------------------------------------------------------------------
+_parent_cmd="$(tr '\0' ' ' < "/proc/${PPID}/cmdline" 2>/dev/null | cut -c1-200)"
+
+# ---------------------------------------------------------------------------
+# Atomic admission (OPERATOR 2026-09-11, H.1): the previous cap check ran
+# `pgrep -f` OUTSIDE any lock, so N concurrent per-board dispatch loops all
+# read a stale low count and passed before their siblings registered (TOCTOU)
+# — the ~70-worker storm. It was also fooled by ANY process whose cmdline
+# merely mentioned the script name. Replace with an flock-serialized,
+# self-healing PID-slot directory: each admitted wrapper drops a
+# ``<pid>.slot``; the count (dead PIDs pruned) is authoritative because every
+# admitted wrapper is itself visible to the next.
+# ---------------------------------------------------------------------------
+_GATE_LOCK="$HOME/.hermes/bot/.fleet_gate.lock"
+_SLOT_DIR="$HOME/.hermes/bot/.fleet_slots"
+mkdir -p "$_SLOT_DIR" 2>/dev/null || true
+
+_cleanup_slot() {
+    rm -f "$_SLOT_DIR/$_WRAPPER_PID.slot" 2>/dev/null || true
+    rm -f "${_SPAWN_MARK:-/nonexistent}" 2>/dev/null || true
+}
+trap '_cleanup_slot' EXIT
+
+_gate_reason=""
+_live_siblings=0
+exec 9>"$_GATE_LOCK" 2>/dev/null || true
+if [[ -w "$_GATE_LOCK" ]] && flock -w 15 9; then
+    # Prune slots whose PID is gone (wrapper was SIGKILLed / crashed).
+    for _sf in "$_SLOT_DIR"/*.slot; do
+        [[ -e "$_sf" ]] || continue
+        _sp="$(basename "$_sf" .slot)"
+        kill -0 "$_sp" 2>/dev/null || rm -f "$_sf"
+    done
+    _live_siblings=$(find "$_SLOT_DIR" -maxdepth 1 -name '*.slot' 2>/dev/null | wc -l)
+    if [[ -e "$HOME/.hermes/ESTOP" ]]; then
+        _gate_reason="estop"
+    elif [[ -e "$HOME/.hermes/bot/.dispatch_frozen" ]]; then
+        _gate_reason="dispatch_frozen"
+    elif [[ -e "$HOME/.hermes/bot/.fleet_quarantine" ]]; then
+        _gate_reason="quarantine"
+    elif [[ "${_live_siblings:-0}" -ge "$_FLEET_CAP" ]]; then
+        _gate_reason="fleet_cap(${_live_siblings}>=${_FLEET_CAP})"
+    else
+        # Reserve our slot while still holding the lock.
+        : > "$_SLOT_DIR/$_WRAPPER_PID.slot" 2>/dev/null || true
+        _live_siblings=$(( _live_siblings + 1 ))
+    fi
+    flock -u 9
+else
+    # Fail safe: if the lock cannot be taken, refuse this spawn rather than
+    # risk adding to an unbounded burst.
+    _gate_reason="gate_lock_unavailable"
+fi
+exec 9>&- 2>/dev/null || true
+
+if [[ -n "$_gate_reason" ]]; then
+    {
+        printf '%s GATED task=%s board=%s reason=%s wrapper=%s ppid=%s parent="%s"\n' \
+            "$_START_TS" "$_TASK_ID" "${HERMES_KANBAN_BOARD:-?}" "$_gate_reason" \
+            "$_WRAPPER_PID" "$PPID" "$_parent_cmd"
+    } >> "$_SPAWN_LOG" 2>/dev/null || true
+    echo "FLEET GATE: ${_gate_reason} — releasing task ${_TASK_ID} to ready (no spend)." >&2
+    exit 75
+fi
+
+# Spawner audit (every allowed spawn) — identifies the dispatch mechanism.
+# Idempotence guard (I.7): a rare double-invocation under one PID previously
+# wrote two identical SPAWN lines; log at most once per wrapper process.
+_SPAWN_MARK="${TMPDIR:-/tmp}/.fleet_spawn_${_WRAPPER_PID}"
+if [[ ! -e "$_SPAWN_MARK" ]]; then
+    {
+        printf '%s SPAWN task=%s board=%s wrapper=%s ppid=%s live=%s parent="%s"\n' \
+            "$_START_TS" "$_TASK_ID" "${HERMES_KANBAN_BOARD:-?}" "$_WRAPPER_PID" \
+            "$PPID" "${_live_siblings:-0}" "$_parent_cmd"
+    } >> "$_SPAWN_LOG" 2>/dev/null || true
+    : > "$_SPAWN_MARK" 2>/dev/null || true
+fi
 
 # Launch hermes as a child process
 "$_real_hermes" "$@" &
