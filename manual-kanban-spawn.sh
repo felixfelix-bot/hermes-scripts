@@ -77,11 +77,14 @@ env \
 CHILD=$!
 
 # Register the PID — without this the daemon reclaims a live worker's card.
-sqlite3 "$DB" "update tasks set worker_pid=$CHILD,
+# FIX #4: also set status='running'. Registering only worker_pid left the row
+# at 'ready', so the card looked idle while a worker held it and the dispatcher
+# could hand it out again.
+sqlite3 "$DB" "update tasks set status='running', worker_pid=$CHILD,
     claim_lock='$(hostname):$CHILD',
     claim_expires=strftime('%s','now')+$CLAIM_TTL,
     last_heartbeat_at=strftime('%s','now')
   where id='$TASK';" 2>/dev/null || true
-echo "[manual-spawn] registered worker_pid=$CHILD on $BOARD/$TASK" >&2
+echo "[manual-spawn] registered worker_pid=$CHILD + status=running on $BOARD/$TASK" >&2
 
 wait "$CHILD"
