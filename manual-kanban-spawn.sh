@@ -114,6 +114,32 @@ PY
     fi
 fi
 
+# --- BURN GATE (FIX #8, 2026-10-05) -----------------------------------------
+# Why: this escape hatch bypassed the fleet's dispatch SPEND POLICY entirely.
+#   The burn gate (hermes-orchestration/scripts/fleet/burn_gate.py, driven by
+#   state/fleet/burn_policy.json) is what stops dispatch once the day's spend
+#   reaches the cap. The dispatcher and kanban-crash-wrapper.sh both honour it;
+#   this script did not, so manual spawns kept spending on a day already far
+#   over cap (observed 2026-10-05: $106.68 spent against a $15.00 cap, 7.1x).
+#   A kanban spawn IS card-backed, so we assert --card: card-backed work is
+#   admitted while the day is UNDER cap. Over cap, --card does NOT rescue it --
+#   the cap check wins. That asymmetry is the gate working, not a bug.
+#   Escape valve: there is deliberately NO env-var bypass here. To spend past
+#   the cap you must raise the cap in burn_policy.json, which is auditable and
+#   leaves a record of who decided to spend. A silent flag would not.
+BURN_GATE="$HOME_DIR/hermes-orchestration/scripts/fleet/burn_gate.py"
+if [[ -f "$BURN_GATE" ]]; then
+    GATE_OUT="$(python3 "$BURN_GATE" --kind dispatch --card 2>&1)"; GATE_RC=$?
+    if [[ $GATE_RC -ne 0 ]]; then
+        echo "REFUSING: the fleet burn gate denied this dispatch." >&2
+        echo "  ${GATE_OUT:-<no output>}" >&2
+        echo "  $BOARD/$TASK would consume inference on a day already over the spend cap." >&2
+        echo "  Raise daily_usd_cap in ~/hermes-orchestration/state/fleet/burn_policy.json" >&2
+        echo "  (auditable), or wait for the day to roll over. Nothing is lost -- the card waits." >&2
+        exit 4
+    fi
+fi
+
 # Strip any inherited gateway-turn session routing (the dispatcher does the same).
 for k in $(env | grep -oE '^HERMES_SESSION_[A-Z_]*'); do unset "$k"; done
 unset HERMES_CRON_AUTO_DELIVER_TO HERMES_UI_SESSION_ID AI_AGENT HERMES_AGENT 2>/dev/null || true
