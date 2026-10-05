@@ -59,6 +59,40 @@ if pgrep -f "HERMES_KANBAN_TASK=$TASK" >/dev/null 2>&1; then
     exit 2
 fi
 
+# --- SESSION-LIMIT PRE-FLIGHT (FIX #6) --------------------------------------
+# The child can die BEFORE its first API call (Hermes caps concurrent sessions;
+# a startup error exits immediately). The old script registered worker_pid
+# AFTER launching, so a dead-on-arrival child still left a phantom claim that
+# looked like a live worker ("3/3 held by cli", observed on t_ac001750).
+# Count the real registry BEFORE launching: refuse cleanly, register nothing.
+SESS_FILE="$HOME_DIR/.hermes/profiles/$PROFILE/runtime/active_sessions.json"
+SESS_MAX="$(python3 - "$HOME_DIR/.hermes/profiles/$PROFILE/config.yaml" <<'PY' 2>/dev/null || echo 3
+import sys,re
+try:
+    t=open(sys.argv[1]).read()
+    m=re.search(r'^max_concurrent_sessions:\s*(\d+)', t, re.M)
+    print(m.group(1) if m else 3)
+except Exception:
+    print(3)
+PY
+)"
+if [[ -f "$SESS_FILE" ]]; then
+    SESS_N="$(python3 -c "
+import json,sys
+try:
+    d=json.load(open('$SESS_FILE'))
+    ent=d.get('entries', d) if isinstance(d,dict) else d
+    print(len(ent) if ent else 0)
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)"
+    if [[ "${SESS_N:-0}" -ge "${SESS_MAX:-3}" ]]; then
+        echo "REFUSING: at the Hermes session limit (${SESS_N}/${SESS_MAX}) — nothing registered." >&2
+        echo "  Slots are held by live sessions in $SESS_FILE — let one finish." >&2
+        exit 3
+    fi
+fi
+
 # Strip any inherited gateway-turn session routing (the dispatcher does the same).
 for k in $(env | grep -oE '^HERMES_SESSION_[A-Z_]*'); do unset "$k"; done
 unset HERMES_CRON_AUTO_DELIVER_TO HERMES_UI_SESSION_ID AI_AGENT HERMES_AGENT 2>/dev/null || true
@@ -82,6 +116,14 @@ env \
   TERMINAL_CWD="$WS" \
   "$HERMES_BIN" -p "$PROFILE" chat "${MODEL_ARGS[@]}" -q "work kanban task $TASK" &
 CHILD=$!
+
+# FIX #6b: verify the child survived startup BEFORE registering it. A child that
+# dies on its first API call (session cap, bad model, 503) must leave NO claim.
+sleep 3
+if ! kill -0 "$CHILD" 2>/dev/null; then
+    echo "REFUSING: child died during startup (pid $CHILD) — nothing registered." >&2
+    exit 4
+fi
 
 # Register the PID — without this the daemon reclaims a live worker's card.
 # FIX #4: also set status='running'. Registering only worker_pid left the row
