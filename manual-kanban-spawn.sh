@@ -8,25 +8,28 @@
 #
 # Usage: manual-kanban-spawn.sh <board> <task_id> <profile> [workspace]
 #
-# FIX 2026-10-05 #1: the workspace is READ FROM THE BOARD DB
-#   (tasks.workspace_path), not guessed. Worktree tasks do NOT live at
-#   ~/worktrees/<task> — a repo-project task lives at <repo>/.worktrees/<task>.
-#   Guessing made the spawn die with "no workspace".
+# FIX 2026-10-05 #1: workspace is READ FROM THE BOARD DB (tasks.workspace_path),
+#   not guessed. Repo-project worktrees live at <repo>/.worktrees/<task>, not
+#   ~/worktrees/<task>; guessing died with "no workspace".
 #
-# FIX 2026-10-05 #2 (CRITICAL): REGISTER THE CHILD PID.
-#   Without it `tasks.worker_pid` stays NULL and the daemon's reconcile loop
-#   treats the claim as foreign and RECLAIMS THE CARD WHILE THE WORKER IS STILL
-#   RUNNING (observed: t_38d3f879 reclaimed with a 57s-old heartbeat; the
-#   worker kept working for 14 min against an orphaned card). So: launch the
-#   child in the background, write worker_pid + a future claim_expires, then
-#   wait on it. This is what the real dispatcher does.
+# FIX 2026-10-05 #2 (CRITICAL): REGISTER THE CHILD PID. Without it
+#   tasks.worker_pid stays NULL and the daemon's reconcile loop treats the
+#   claim as foreign and RECLAIMS THE CARD WHILE THE WORKER IS STILL RUNNING
+#   (observed: reclaimed with a 57s-old heartbeat; the worker kept working 14
+#   more minutes against an orphaned card).
+#
+# FIX 2026-10-05 #3 (CRITICAL): DUPLICATE-SPAWN GUARD. Spawning a second worker
+#   onto a card that ALREADY HAS A LIVE WORKER puts two agents in ONE worktree:
+#   they race each other's edits/commits/checkouts and can corrupt or lose work.
+#   This script tracked the LATEST pid, so it could not even see the first one.
+#   Now it refuses while the recorded pid is alive. (Observed on t_119a4ab8.)
 set -uo pipefail
 
 BOARD="${1:?board}"; TASK="${2:?task id}"; PROFILE="${3:?profile}"
 HOME_DIR="/home/c03rad0r"
 HERMES_BIN="$HOME_DIR/.hermes/hermes-agent/venv/bin/hermes"
 DB="$HOME_DIR/.hermes/kanban/boards/$BOARD/kanban.db"
-CLAIM_TTL="${CLAIM_TTL:-7200}"   # seconds; generous — a long worker must not be reclaimed mid-flight
+CLAIM_TTL="${CLAIM_TTL:-7200}"   # seconds; a long worker must not be reclaimed mid-flight
 
 # --- resolve the workspace (authoritative source, in order) -----------------
 WS="${4:-}"
@@ -41,11 +44,20 @@ if [[ -z "$WS" ]]; then
 fi
 [[ -n "$WS" && -d "$WS" ]] || { echo "no workspace for $TASK (db='${WS:-none}')" >&2; exit 1; }
 
-# --- claim the card if it is not already ours -------------------------------
-sqlite3 "$DB" "update tasks set status='running',
-    claim_lock='$(hostname):$$',
-    claim_expires=strftime('%s','now')+$CLAIM_TTL
-  where id='$TASK' and status in ('ready','todo','scheduled');" 2>/dev/null || true
+# --- DUPLICATE-SPAWN GUARD: never put two workers in one worktree ----------
+EXISTING="$(sqlite3 "$DB" "select coalesce(worker_pid,'') from tasks where id='$TASK';" 2>/dev/null)"
+if [[ -n "$EXISTING" ]] && kill -0 "$EXISTING" 2>/dev/null; then
+    echo "REFUSING: $BOARD/$TASK already has a LIVE worker (pid $EXISTING)." >&2
+    echo "  Two workers in $WS would race each other's edits and lose work." >&2
+    echo "  Wait for it, or kill $EXISTING deliberately (push unpushed commits FIRST)." >&2
+    exit 2
+fi
+# Also catch an untracked agent already sitting in the worktree.
+if pgrep -f "HERMES_KANBAN_TASK=$TASK" >/dev/null 2>&1; then
+    echo "REFUSING: a process for $TASK is already running (not recorded in DB)." >&2
+    pgrep -af "HERMES_KANBAN_TASK=$TASK" >&2
+    exit 2
+fi
 
 # Strip any inherited gateway-turn session routing (the dispatcher does the same).
 for k in $(env | grep -oE '^HERMES_SESSION_[A-Z_]*'); do unset "$k"; done
