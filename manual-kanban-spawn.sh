@@ -66,6 +66,13 @@ unset HERMES_CRON_AUTO_DELIVER_TO HERMES_UI_SESSION_ID AI_AGENT HERMES_AGENT 2>/
 echo "[manual-spawn] board=$BOARD task=$TASK profile=$PROFILE ws=$WS" >&2
 
 # --- launch child in the BACKGROUND so we can register its PID --------------
+# FIX 2026-10-05 #5: MODEL_OVERRIDE. Cross-family review (D-115/D-128) needs a
+#   reviewer from a DIFFERENT family than the author. The profile default
+#   (tier/coding-worker -> GLM) would self-review. MODEL_OVERRIDE=tier/review-kimi
+#   pins the reviewer lane; unset means the profile default.
+MODEL_ARGS=()
+[[ -n "${MODEL_OVERRIDE:-}" ]] && MODEL_ARGS=(-m "$MODEL_OVERRIDE")
+
 env \
   HERMES_HOME="$HOME_DIR/.hermes/profiles/$PROFILE" \
   HERMES_KANBAN_TASK="$TASK" \
@@ -73,7 +80,7 @@ env \
   HERMES_KANBAN_WORKSPACE="$WS" \
   HERMES_SESSION_SOURCE="kanban" \
   TERMINAL_CWD="$WS" \
-  "$HERMES_BIN" -p "$PROFILE" chat -q "work kanban task $TASK" &
+  "$HERMES_BIN" -p "$PROFILE" chat "${MODEL_ARGS[@]}" -q "work kanban task $TASK" &
 CHILD=$!
 
 # Register the PID — without this the daemon reclaims a live worker's card.
