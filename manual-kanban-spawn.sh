@@ -59,12 +59,16 @@ if pgrep -f "HERMES_KANBAN_TASK=$TASK" >/dev/null 2>&1; then
     exit 2
 fi
 
-# --- SESSION-LIMIT PRE-FLIGHT (FIX #6) --------------------------------------
-# The child can die BEFORE its first API call (Hermes caps concurrent sessions;
-# a startup error exits immediately). The old script registered worker_pid
-# AFTER launching, so a dead-on-arrival child still left a phantom claim that
-# looked like a live worker ("3/3 held by cli", observed on t_ac001750).
-# Count the real registry BEFORE launching: refuse cleanly, register nothing.
+# --- SESSION-LIMIT PRE-FLIGHT (FIX #6, #7) ---------------------------------
+# FIX #6: the child can die BEFORE its first API call (Hermes caps concurrent
+#   sessions), and the old script registered worker_pid AFTER launching — so a
+#   dead-on-arrival child still left a phantom claim ("3/3 held by cli").
+# FIX #7 (SYSTEMIC): Hermes LEAKS dead session leases. Ending a worker abruptly
+#   skips lease cleanup, so active_sessions.json keeps an entry whose pid is
+#   long gone. The gateway counts those, so the cap fills up with ghosts and
+#   EVERY future spawn is refused ("3/3"). Observed: a worker ended by hand
+#   held a slot for good. Here we prune leases whose pid is gone
+#   (verified via /proc, under the registry's own file lock) BEFORE counting.
 SESS_FILE="$HOME_DIR/.hermes/profiles/$PROFILE/runtime/active_sessions.json"
 SESS_MAX="$(python3 - "$HOME_DIR/.hermes/profiles/$PROFILE/config.yaml" <<'PY' 2>/dev/null || echo 3
 import sys,re
@@ -77,15 +81,32 @@ except Exception:
 PY
 )"
 if [[ -f "$SESS_FILE" ]]; then
-    SESS_N="$(python3 -c "
-import json,sys
+    read -r SESS_N PRUNED < <(python3 - "$SESS_FILE" <<'PY' 2>/dev/null || echo "0 0"
+import json, os, sys, fcntl
+f = sys.argv[1]
+lock = f.replace('.json', '.lock')
 try:
-    d=json.load(open('$SESS_FILE'))
-    ent=d.get('entries', d) if isinstance(d,dict) else d
-    print(len(ent) if ent else 0)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
 except Exception:
-    print(0)
-" 2>/dev/null || echo 0)"
+    fd = None
+try:
+    d = json.load(open(f))
+    ent = d.get('entries', d)
+    alive = [e for e in ent if os.path.exists('/proc/%s' % e.get('pid'))]
+    pruned = len(ent) - len(alive)
+    if pruned:
+        d['entries'] = alive
+        tmp = f + '.tmp'
+        json.dump(d, open(tmp, 'w'), indent=2)
+        os.replace(tmp, f)
+    print(len(alive), pruned)
+finally:
+    if fd is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+PY
+)
+    [[ "${PRUNED:-0}" -gt 0 ]] && echo "[manual-spawn] pruned $PRUNED leaked (dead-pid) session lease(s)" >&2
     if [[ "${SESS_N:-0}" -ge "${SESS_MAX:-3}" ]]; then
         echo "REFUSING: at the Hermes session limit (${SESS_N}/${SESS_MAX}) — nothing registered." >&2
         echo "  Slots are held by live sessions in $SESS_FILE — let one finish." >&2
