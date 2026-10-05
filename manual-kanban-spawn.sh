@@ -8,17 +8,25 @@
 #
 # Usage: manual-kanban-spawn.sh <board> <task_id> <profile> [workspace]
 #
-# The workspace is READ FROM THE BOARD DB (tasks.workspace_path), not guessed.
-# Bug fixed 2026-10-05: worktree tasks do NOT live at ~/worktrees/<task> — a
-# repo-project task lives at <repo>/.worktrees/<task>. Guessing the path made
-# the spawn die with "no workspace". The claim output already knows the real
-# path; the DB is the authority. An explicit 4th arg overrides the lookup.
+# FIX 2026-10-05 #1: the workspace is READ FROM THE BOARD DB
+#   (tasks.workspace_path), not guessed. Worktree tasks do NOT live at
+#   ~/worktrees/<task> — a repo-project task lives at <repo>/.worktrees/<task>.
+#   Guessing made the spawn die with "no workspace".
+#
+# FIX 2026-10-05 #2 (CRITICAL): REGISTER THE CHILD PID.
+#   Without it `tasks.worker_pid` stays NULL and the daemon's reconcile loop
+#   treats the claim as foreign and RECLAIMS THE CARD WHILE THE WORKER IS STILL
+#   RUNNING (observed: t_38d3f879 reclaimed with a 57s-old heartbeat; the
+#   worker kept working for 14 min against an orphaned card). So: launch the
+#   child in the background, write worker_pid + a future claim_expires, then
+#   wait on it. This is what the real dispatcher does.
 set -uo pipefail
 
 BOARD="${1:?board}"; TASK="${2:?task id}"; PROFILE="${3:?profile}"
 HOME_DIR="/home/c03rad0r"
 HERMES_BIN="$HOME_DIR/.hermes/hermes-agent/venv/bin/hermes"
 DB="$HOME_DIR/.hermes/kanban/boards/$BOARD/kanban.db"
+CLAIM_TTL="${CLAIM_TTL:-7200}"   # seconds; generous — a long worker must not be reclaimed mid-flight
 
 # --- resolve the workspace (authoritative source, in order) -----------------
 WS="${4:-}"
@@ -26,7 +34,6 @@ if [[ -z "$WS" && -f "$DB" ]]; then
     WS="$(sqlite3 "$DB" \
         "select coalesce(workspace_path,'') from tasks where id='$TASK';" 2>/dev/null)"
 fi
-# Fallbacks only if the DB gave nothing (scratch tasks have no path).
 if [[ -z "$WS" ]]; then
     for cand in "$HOME_DIR/worktrees/$TASK" "$HOME_DIR/repos/$BOARD/.worktrees/$TASK"; do
         [[ -d "$cand" ]] && { WS="$cand"; break; }
@@ -34,17 +41,35 @@ if [[ -z "$WS" ]]; then
 fi
 [[ -n "$WS" && -d "$WS" ]] || { echo "no workspace for $TASK (db='${WS:-none}')" >&2; exit 1; }
 
+# --- claim the card if it is not already ours -------------------------------
+sqlite3 "$DB" "update tasks set status='running',
+    claim_lock='$(hostname):$$',
+    claim_expires=strftime('%s','now')+$CLAIM_TTL
+  where id='$TASK' and status in ('ready','todo','scheduled');" 2>/dev/null || true
+
 # Strip any inherited gateway-turn session routing (the dispatcher does the same).
 for k in $(env | grep -oE '^HERMES_SESSION_[A-Z_]*'); do unset "$k"; done
 unset HERMES_CRON_AUTO_DELIVER_TO HERMES_UI_SESSION_ID AI_AGENT HERMES_AGENT 2>/dev/null || true
 
 echo "[manual-spawn] board=$BOARD task=$TASK profile=$PROFILE ws=$WS" >&2
 
-exec env \
+# --- launch child in the BACKGROUND so we can register its PID --------------
+env \
   HERMES_HOME="$HOME_DIR/.hermes/profiles/$PROFILE" \
   HERMES_KANBAN_TASK="$TASK" \
   HERMES_KANBAN_BOARD="$BOARD" \
   HERMES_KANBAN_WORKSPACE="$WS" \
   HERMES_SESSION_SOURCE="kanban" \
   TERMINAL_CWD="$WS" \
-  "$HERMES_BIN" -p "$PROFILE" chat -q "work kanban task $TASK"
+  "$HERMES_BIN" -p "$PROFILE" chat -q "work kanban task $TASK" &
+CHILD=$!
+
+# Register the PID — without this the daemon reclaims a live worker's card.
+sqlite3 "$DB" "update tasks set worker_pid=$CHILD,
+    claim_lock='$(hostname):$CHILD',
+    claim_expires=strftime('%s','now')+$CLAIM_TTL,
+    last_heartbeat_at=strftime('%s','now')
+  where id='$TASK';" 2>/dev/null || true
+echo "[manual-spawn] registered worker_pid=$CHILD on $BOARD/$TASK" >&2
+
+wait "$CHILD"
