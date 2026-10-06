@@ -267,10 +267,19 @@ def gate_promote(argv):
     board = resolve_board(argv)
     sql(board, migrate)  # close the fail-open hole on un-migrated boards
     ids = [a for a in argv if a.startswith("t_")]
+    if not ids:
+        # Guard before the query: an empty id list renders ``IN ()``, which is a
+        # SQL syntax error that sql()'s fail-open reports as the misleading
+        # "unable to open database file".
+        log("promote: no task ids given"); return 0
+    # The lambda already flattens the rows; do NOT unpack a second time
+    # (2026-10-06: `ok = [i for (i,) in (ok or [])]` unpacked each *string* id
+    # into one element -> `ValueError: too many values to unpack`, so
+    # `hermes kanban promote <t_id>` died / silently never reached the CLI).
     ok = sql(board, lambda c: [i for (i,) in c.execute(
         "SELECT id FROM tasks WHERE id IN (%s) AND urgency IS NOT NULL" %
-        ",".join("?" * len(ids)), ids)] or [])
-    ok = [i for (i,) in (ok or [])]
+        ",".join("?" * len(ids)), ids)]) or []
+    ok = list(ok)
     refuse = [i for i in ids if i not in ok]
     for tid in refuse:
         park(board, tid, "urgency-unclassified: promote refused until classified")
