@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""state_db_health.py — snapshot-based integrity probe for profile state.db files.
+"""state_db_health.py — bounded integrity probe for profile state.db files.
 
 Canonical detector for the 2026-09-28 state.db-corruption incident. Absorbs the
 *integrity* half of `scripts/engine/db_health_check.py` (that script keeps its
@@ -7,10 +7,10 @@ nightly compaction role) but runs on a fast timer (15 min) instead of nightly,
 and never mutates a live database.
 
 Design:
-  * A live database is never poked under a running gateway. Small DBs
-    (< SNAPSHOT_THRESHOLD_BYTES) are checked live with a short hang guard; at or
-    above the threshold — or when a live check times out — a SQLite backup-API
-    snapshot is taken and `quick_check` runs *offline* on the snapshot.
+  * A live database is probed with a read-only, bounded `PRAGMA quick_check` via
+    URI `mode=ro`. This takes no write lock, creates no WAL/journal sidecars,
+    and avoids the full-file SQLite backup copy that was holding shared locks on
+    large databases for tens of seconds and starving the gateway writer.
   * A timeout is reported as `unknown` (never `corrupted`), so a busy large DB
     cannot be mistaken for damage.
   * Writes one machine-readable result to `$HERMES_HOME/bot/state_db_health.json`;
@@ -41,19 +41,23 @@ STATE = BOT / "state_db_health.json"
 
 SNAPSHOT_THRESHOLD_BYTES = int(
     os.environ.get("STATE_DB_SNAPSHOT_THRESHOLD_BYTES", 100 * 1024 * 1024))
-LIVE_TIMEOUT_S = int(os.environ.get("STATE_DB_LIVE_TIMEOUT_S", 10))
-SNAPSHOT_TIMEOUT_S = int(os.environ.get("STATE_DB_SNAPSHOT_TIMEOUT_S", 120))
+LIVE_TIMEOUT_S = int(os.environ.get("STATE_DB_LIVE_TIMEOUT_S", 45))
+# Legacy variable kept for compatibility; the probe no longer copies large DBs.
+SNAPSHOT_TIMEOUT_S = int(os.environ.get("STATE_DB_SNAPSHOT_TIMEOUT_S", 60))
 PROBE_MAX_AGE_S = int(os.environ.get("STATE_DB_PROBE_MAX_AGE_S", 3600))
 # Hard ceiling on the whole probe. On a busy node (e.g. dq05 running
 # bitcoind/electrs) a single large DB's quick_check or snapshot can take tens of
 # seconds; without a budget the probe wedges the timer and never writes state.
 # Remaining DBs are reported 'unknown' (never 'corrupted') once the budget is
-# spent.
-TOTAL_BUDGET_S = int(os.environ.get("STATE_DB_PROBE_BUDGET_S", 300))
+# spent. Since large DBs are no longer copied, the probe now completes quickly;
+# keep a modest ceiling to catch pathological cases.
+TOTAL_BUDGET_S = int(os.environ.get("STATE_DB_PROBE_BUDGET_S", 180))
 # Hard per-DB ceiling enforced in a child process, so a wedged SQLite C call
 # (a backup blocked on a busy/locked source) can never hang the probe. The
-# budget covers the sum; this covers any single DB.
-PER_DB_TIMEOUT_S = int(os.environ.get("STATE_DB_PER_DB_TIMEOUT_S", 150))
+# budget covers the sum; this covers any single DB. With the snapshot path gone
+# the actual check is a bounded read-only quick_check, so this is a generous
+# safety net rather than the expected runtime.
+PER_DB_TIMEOUT_S = int(os.environ.get("STATE_DB_PER_DB_TIMEOUT_S", 45))
 # A hard per-DB timeout SIGKILLs the child, so its own cleanup cannot run. The
 # parent therefore owns the snapshot temp path (passed via --tmp) and sweeps any
 # leftover `.state_db_health-*` older than this many seconds. Without this the
@@ -146,6 +150,24 @@ def check_conn(conn: sqlite3.Connection, timeout_s: int) -> tuple[str, str]:
     return verdict_from_rows(rows)
 
 
+def check_conn_ro(path: Path, timeout_s: int = LIVE_TIMEOUT_S) -> tuple[str, str]:
+    """Bounded read-only quick_check on a live database.
+
+    Opens via URI ``mode=ro`` so the probe cannot accidentally write, migrate,
+    or create WAL sidecars. A short busy timeout plus a Python-level progress
+    handler bound the wait when a gateway writer holds the database.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                               timeout=max(1.0, min(timeout_s / 3.0, 10.0)))
+    except sqlite3.Error as exc:
+        return "corrupted", f"open failed: {exc}"
+    try:
+        return check_conn(conn, timeout_s)
+    finally:
+        conn.close()
+
+
 def verdict_from_rows(rows: list[str]) -> tuple[str, str]:
     """Pure classifier for quick_check output (unit-testable)."""
     if rows == ["ok"]:
@@ -178,41 +200,18 @@ def _sweep_stale_temp(directory: Path, age_s: int = STALE_TEMP_MAX_AGE_S) -> int
 def classify_db(path: Path, threshold: int | None = None,
                 tmp_path: Path | None = None) -> dict:
     """Classify one state.db without mutating it. Returns a result dict."""
-    threshold = SNAPSHOT_THRESHOLD_BYTES if threshold is None else threshold
     try:
         size = path.stat().st_size
     except OSError as exc:
         return {"profile": path.parent.name, "path": str(path), "verdict": "unknown",
                 "via": "stat", "size": 0, "detail": f"stat failed: {exc}"}
-    if size < threshold:
-        try:
-            conn = sqlite3.connect(str(path), timeout=5)
-            try:
-                verdict, detail = check_conn(conn, LIVE_TIMEOUT_S)
-            finally:
-                conn.close()
-        except sqlite3.Error as exc:
-            verdict, detail = "corrupted", f"open failed: {exc}"
-        via = "live"
-    else:
-        tmp = tmp_path or path.parent / f".state_db_health-{os.getpid()}-{int(_ts())}"
-        try:
-            snapshot_db(path, tmp, SNAPSHOT_TIMEOUT_S)
-            conn = sqlite3.connect(str(tmp), timeout=5)
-            try:
-                verdict, detail = check_conn(conn, SNAPSHOT_TIMEOUT_S)
-            finally:
-                conn.close()
-        except TimeoutError:
-            verdict, detail = "unknown", f"snapshot timeout after {SNAPSHOT_TIMEOUT_S}s"
-        except sqlite3.Error as exc:
-            verdict, detail = "corrupted", f"snapshot failed: {exc}"
-        finally:
-            for suffix in ("", "-wal", "-shm"):
-                Path(str(tmp) + suffix).unlink(missing_ok=True)
-        via = "snapshot"
+    # Always use the read-only bounded quick_check. The old snapshot path copied
+    # the entire file via the SQLite backup API and held a shared lock for tens
+    # of seconds on 300-600 MB databases, starving the gateway writer and
+    # causing session persistence failures in background workers.
+    verdict, detail = check_conn_ro(path, LIVE_TIMEOUT_S)
     return {"profile": path.parent.name, "path": str(path), "verdict": verdict,
-            "via": via, "size": size, "detail": detail}
+            "via": "ro_quick_check", "size": size, "detail": detail}
 
 
 def snapshot_db(src: Path, dst: Path, timeout_s: int | None = None) -> None:
