@@ -227,6 +227,83 @@ def test_comment_written_after_completion_credits(tmp_path, monkeypatch):
     assert r["verdict"] == "pass", r
 
 
+# ── cold review of #11 (kimi-k3, REQUEST_CHANGES) — verified findings ────────
+#
+# Each of these was reproduced against the code before being fixed; one claimed
+# finding (`/commit/` matching mid-word in `https://acme.io/commitments`) did
+# NOT reproduce — the path patterns are slash-anchored — so no test was added
+# for it. One finding is an accepted residual, documented in
+# docs/delivery-tier.md rather than asserted here: a resolvable `/blob/…`
+# CITATION in the result is byte-indistinguishable from a published doc URL
+# without fetching it, and the gate is regex-only by design.
+
+def test_failure_reported_on_the_line_above_is_rejected():
+    """Blocker 1: line-scoped negation is evaded by a single newline."""
+    for text in (
+        "failed to publish the artifact\nhttps://github.com/o/r/pull/9",
+        "STATUS: FAILED\nhttps://github.com/o/r/issues/9",
+        "could not attach the recording\n"
+        "intended target: https://github.com/o/r/pull/9",
+    ):
+        assert not ge.delivery_evidence_present(text), f"wrongly credited: {text!r}"
+
+
+def test_negation_lexicon_covers_contractions():
+    """Blocker 2: `wasn't` / `didn't` / `hasn't` / `not yet` were absent, so a
+    failure report phrased with any of them credited the gate."""
+    for opener in ("wasn't posted", "didn't upload", "hasn't been published",
+                   "not yet posted", "could not post", "cannot post",
+                   "unable to publish", "weren't attached"):
+        assert not ge.delivery_evidence_present(
+            f"{opener}: https://github.com/o/r/issues/9"), opener
+
+
+def test_negation_after_the_url_does_not_disqualify():
+    """Major: the negation is the clause that INTRODUCES the URL. Reading it
+    anywhere on the line (or later) blocks a card whose first attempt failed
+    and whose retry succeeded — a false negative on genuine evidence."""
+    for ok in (
+        "published https://x.io/pull/7; the first attempt failed to upload, retry OK",
+        "https://github.com/o/r/pull/7 (an earlier attempt could not post)",
+    ):
+        assert ge.delivery_evidence_present(ok), f"wrongly blocked: {ok!r}"
+
+
+def test_content_addressed_and_forge_paths_credit():
+    """Major, false negatives. Blossom serves at /<sha256> with NO extension —
+    the fleet's own media rail — and GitLab / gist / njump links are ordinary
+    delivery surfaces."""
+    for url in (
+        "https://blossom.primal.net/" + "a" * 64,
+        "https://gitlab.com/g/p/-/merge_requests/12",
+        "https://gist.github.com/user/" + "b" * 32,
+        "https://njump.me/" + "c" * 64,
+        "https://njump.me/note1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+    ):
+        assert ge.delivery_evidence_present(url), f"not credited: {url}"
+
+
+def test_same_second_comment_credits(tmp_path, monkeypatch):
+    """Minor: `c > cut` dropped a comment written in the same second as
+    completion — the normal shape when a worker completes and comments in one
+    turn, since both land in the same unix second."""
+    monkeypatch.setattr(ge, "BOARDS", tmp_path)
+    monkeypatch.delenv("GATES_ENFORCE_SINCE_TS", raising=False)
+    now = int(time.time())
+    board, tid = _board(tmp_path, result=f"Completed.\n{SCAN_CLEAN}",
+                        pre=[f"TASK: post the evidence to {PR_COMMENT_URL}"],
+                        post=[f"Evidence: {PR_COMMENT_URL}"],
+                        completed_at=now)
+    conn = sqlite3.connect(tmp_path / board / "kanban.db")
+    conn.execute("update task_comments set created_at=? where body like 'Evidence:%'",
+                 (now,))
+    conn.commit()
+    conn.close()
+    r = ge.evaluate_task(board, tid, SPEC)
+    assert "delivery_evidence" in r["passed"], r
+    assert r["verdict"] == "pass", r
+
+
 # ── the spec routes the tags (D-165: a typo can never fail open) ─────────────
 
 def test_spec_defines_the_delivery_tier():

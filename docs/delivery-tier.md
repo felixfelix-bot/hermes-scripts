@@ -57,12 +57,20 @@ Accepted path shapes, on a host that could resolve:
 - `…/issues/<n>`, `…/discussions/<n>`
 - a raw artifact URL ending in `.mp4 .webm .mov .mkv .png .jpg .jpeg .webp`
 - `raw.githubusercontent.com/…` / `raw.github.com/…` with a real file path
+- a content-addressed path — `/<sha256>` — which is how Blossom serves media,
+  with no file extension at all
+- `gist.github.com/…`, and the Nostr viewers `njump.me` / `njump.to` /
+  `nostr.band` / `iris.to` (the host names the artifact, the path is an opaque
+  id); GitLab `…/merge_requests/<n>` and `…/-/<rest>`
 
 Rejected:
 
 - prose ("Delivered the thing, all done") — always was, still is;
-- a **failure** report — `could not post to …/pull/12` names the same URL as a
-  success and is rejected by the *scoping* rule below, not by the URL shape;
+- a **failure** report — `could not post to …/pull/12` names the same URL a
+  success would. Rejected by reading the 100 characters **preceding** the URL
+  (the window may cross a newline) for a negation — `\w+n't`, `cannot`,
+  `fail…`, `blocked`, `denied`, `no write access`, `not yet` — never the URL's
+  own line alone, and never text *after* it;
 - a bare filename with no host (`http://a.png`, `see shot.png`);
 - a host that cannot resolve — `…invalid`, `example.*`, `localhost`, a
   special-use TLD, or a host whose last label is a file extension
@@ -81,7 +89,13 @@ review falsified: filenames with no host, and hosts that cannot resolve.
 `delivery_evidence` reads **only**:
 
 1. the task **result** (the completion message), and
-2. comments whose `created_at` is **after** the task's `completed_at`.
+2. comments whose `created_at` is **>=** the task's `completed_at`.
+
+(`>=`, not `>`: a worker that completes and comments in the same turn lands both
+in the same unix second, and a strict `>` silently dropped that evidence. The
+residual is a one-second window in which a pre-completion comment is treated as
+post-completion. The **result** is the primary surface — this is the follow-up
+convenience path.)
 
 It never reads the aggregate evidence blob, and never the card body.
 
@@ -119,3 +133,36 @@ claiming a gate change is live:
 python3 -c "import sys; sys.path.insert(0,'$HOME/.hermes/bot/governance'); \
 import gate_engine as ge; print(ge.__file__, hasattr(ge,'delivery_evidence_present'))"
 ```
+## Known residuals (stated, not hidden)
+
+These are accepted, not fixed. The gate is a *claim checker*, not a verifier,
+and it is regex-only by design.
+
+1. **A citation is indistinguishable from a publication.** A resolvable
+   `/blob/…` or `/pull/…` URL quoted as a *source* ("copied approach from
+   https://github.com/org/repo/blob/main/spec.md") credits the gate exactly like
+   a published artifact does. Separating them needs the URL fetched, which this
+   gate must never do. Scoping is the real defence: a citation in a pre-completion
+   comment is out of scope, so only a citation in the result or a post-completion
+   comment can mislead.
+2. **A hand-typed bogus-but-plausible host** (`https://acme-notreal.com/x.mp4`)
+   is credited. Same reason: it needs a DNS/HTTP lookup.
+3. **One-second comment window** (see Scoping above).
+
+What the hardening does close, verified input by input against the code: a bare
+filename with no host, a host that cannot resolve, a templated URL, a failure
+report on the line above (or anywhere in the 100 chars before) the URL, and a
+retried success whose line narrates an earlier failure.
+
+## Review rounds
+
+- **#10** — kimi-k3, `REQUEST_CHANGES`: proved a URL was *mentioned*, not
+  *posted*. Fixed by scoping + host anchoring + dropping the generic tags.
+- **#11** — kimi-k3, `REQUEST_CHANGES` on the first version of *this* fix:
+  found the newline evasion of line-scoped negation, an incomplete negation
+  lexicon (`wasn't`, `didn't`, `not yet`), the `>=` same-second drop, and three
+  false negatives (Blossom content-addressed URLs, GitLab, gist/njump). All
+  reproduced against the code before being fixed; one claimed finding
+  (`/commit/` matching mid-word in `https://acme.io/commitments`) did **not**
+  reproduce — the path patterns are slash-anchored.
+

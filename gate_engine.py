@@ -220,7 +220,9 @@ RE_DELIVERY_URL = re.compile(
 # The path shapes only a PUBLISHED artifact carries.
 RE_DELIVERY_PATH = re.compile(
     r"/pull/\d+|/releases?(?:/|$)|/blob/|/commit/|/issues?/\d+|/discussions?/\d+"
-    r"|/\S+\.(?:mp4|webm|mov|mkv|png|jpe?g|webp)(?:$|[?#])", re.I)
+    r"|/merge_requests/\d+|/-\/\S+"
+    r"|/[0-9a-f]{32,}(?:$|[?#])"
+    r"|/[\w.-]+\.(?:mp4|webm|mov|mkv|png|jpe?g|webp)(?:$|[?#])", re.I)
 
 # Hosts that can never name a published artifact: the RFC-2606 documentation
 # names (example/invalid/localhost), the RFC-6761 special-use TLDs, and a host
@@ -241,24 +243,35 @@ RE_RAW_CONTENT_HOST = re.compile(
     r"^(?:raw\.githubusercontent\.com|raw\.github\.com|"
     r"objects\.githubusercontent\.com)$", re.I)
 
+# Hosts where the HOST ITSELF names the artifact and the path is an opaque id:
+# a gist, or a Nostr event viewer (njump is the fleet's usual link shape for a
+# published note). Blossom is covered by the content-addressed path pattern
+# above — it serves /<sha256> with no file extension at all.
+RE_ARTIFACT_HOST = re.compile(
+    r"^(?:gist\.github\.com|njump\.me|njump\.to|nostr\.band|iris\.to|"
+    r"primal\.net|blossom\.[A-Za-z0-9.-]+)$", re.I)
+
 
 # A URL quoted inside a FAILURE report is not evidence: "Blocked: could not post
-# to …/pull/12 — the token lacks write access" names exactly the URL a success
-# would, so the URL shape alone cannot tell them apart — the LINE the URL sits
-# on has to be read. Scoped to that one line on purpose, so a refusal narrated
-# elsewhere in a long comment cannot disarm a real assertion (same rule as
-# RE_CONSOLIDATED).
+# to …/pull/12" names exactly the URL a success would, so the URL shape alone
+# cannot tell them apart and a negation has to be read as well.
+#
+# SCOPE (cold review of #11): the window is the text immediately BEFORE the URL,
+# not its line. Line scope was evaded by a single newline ("failed to publish
+# the artifact\n<URL>" credited) and simultaneously killed a retried success
+# whose line narrated the earlier failure. A preceding window fixes both: only
+# the clause that INTRODUCES the URL can disqualify it. 100 chars, deliberately
+# generous (fail closed), and it may cross a newline on purpose.
+DELIVERY_NEGATION_WINDOW = 100
+
+# The lexicon must cover how failure is actually written. `\w+n['’]t` catches
+# every contraction (wasn't, didn't, hasn't, couldn't, won't) — the first
+# version enumerated them and missed most.
 RE_DELIVERY_NEGATION = re.compile(
-    r"\b(?:could ?n[o']?t|could not|cannot|can'?t|unable to|failed to|failure|"
-    r"blocked|denied|refused|no write access|"
+    r"\b(?:\w+n['’]t|cannot|unable to|fail(?:ed|ure|s)?|blocked|denied|refused|"
+    r"no write access|not yet|"
+    r"(?:could|did|was|were|is|are|has|have|had|do|does|will|would) not|"
     r"not (?:posted|published|delivered|uploaded|attached|committed))\b", re.I)
-
-
-def _line_around(text: str, pos: int) -> str:
-    """The single line containing ``pos`` (no trailing newline)."""
-    start = text.rfind("\n", 0, pos) + 1
-    end = text.find("\n", pos)
-    return text[start:] if end == -1 else text[start:end]
 
 
 def delivery_evidence_present(text: str) -> bool:
@@ -276,13 +289,16 @@ def delivery_evidence_present(text: str) -> bool:
     for m in RE_DELIVERY_URL.finditer(text):
         if RE_TEMPLATED_URL.search(m.group(0)):
             continue
-        if RE_DELIVERY_NEGATION.search(_line_around(text, m.start())):
+        if RE_DELIVERY_NEGATION.search(
+                text[max(0, m.start() - DELIVERY_NEGATION_WINDOW):m.start()]):
             continue
         host = m.group("host") or ""
         path = m.group("path") or ""
         if RE_PLACEHOLDER_HOST.search(host):
             continue
         if RE_RAW_CONTENT_HOST.match(host) and path.count("/") >= 2:
+            return True
+        if RE_ARTIFACT_HOST.match(host) and path.count("/") >= 1:
             return True
         if RE_DELIVERY_PATH.search(path):
             return True
@@ -310,7 +326,14 @@ def delivery_evidence_text(conn: sqlite3.Connection, task_id: str,
                     "select coalesce(body,''), created_at from task_comments"
                     " where task_id=?", (task_id,)):
                 c = _to_epoch(created)
-                if c and c > cut:
+                # >= on purpose (cold review of #11): completing and commenting
+                # land in the same unix second when a worker does both in one
+                # turn, and a strict > silently dropped that evidence. Residual,
+                # stated: a comment written in that same second is treated as
+                # post-completion even if it predates the completion write by
+                # milliseconds. The RESULT is the primary surface; this is the
+                # follow-up-comment convenience path.
+                if c and c >= cut:
                     parts.append(body or "")
         except sqlite3.Error:
             pass
