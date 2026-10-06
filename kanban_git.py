@@ -246,6 +246,57 @@ def sync(repo: Path, boards_root: Path, only: str | None = None) -> int:
     return written
 
 
+def maintenance(repo: Path) -> int:
+    """Reclaim disk + inodes in the kanban git repo.
+
+    2026-10-06 x240: 4.44M loose objects (~1.9M inodes) plus a stale gc.pid from
+    a crashed gc wedged the repo and exhausted the filesystem's inodes. Safe on
+    a live repo: clears a STALE lock, drops leftover temp packs, then runs a
+    bounded ``git gc --prune=now``.
+    """
+    if not (repo / ".git").exists():
+        print(f"kanban_git: {repo} is not a git repo", file=sys.stderr)
+        return 2
+    gitdir = repo / ".git"
+
+    def _count_loose() -> str:
+        p = _git(repo, "count-objects", "-v", timeout=60)
+        for line in (p.stdout or "").splitlines():
+            if line.startswith("count:"):
+                return line.split(":", 1)[1].strip()
+        return "?"
+
+    before = _count_loose()
+    gc_pid = gitdir / "gc.pid"
+    if gc_pid.exists():
+        try:
+            age = time.time() - gc_pid.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age > 300:
+            gc_pid.unlink(missing_ok=True)
+            print(f"kanban_git: removed stale gc.pid (age {int(age)}s)")
+        else:
+            print(f"kanban_git: gc.pid fresh (age {int(age)}s); skipping gc")
+            return 0
+    packdir = gitdir / "objects" / "pack"
+    for pat in ("tmp_pack_*", ".tmp-*"):
+        for p in list(packdir.glob(pat)):
+            try:
+                p.unlink()
+                print(f"kanban_git: removed leftover {p.name}")
+            except OSError:
+                pass
+    r = _git(repo, "gc", "--prune=now", "--quiet",
+             timeout=int(os.environ.get("KANBAN_GIT_GC_TIMEOUT_S", "1800")))
+    if r.returncode != 0:
+        print(f"kanban_git: gc failed rc={r.returncode}: {(r.stderr or '').strip()[:200]}",
+              file=sys.stderr)
+        return 1
+    print(f"kanban_git: gc complete (loose {before} -> {_count_loose()})")
+    return 0
+
+
 def _main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=None)
@@ -255,6 +306,7 @@ def _main(argv: list[str]) -> int:
         s = sub.add_parser(name)
         s.add_argument("--board", default=None)
     sub.choices["import"].add_argument("--apply", action="store_true")
+    sub.add_parser("maintenance")
     c = sub.add_parser("claim")
     c.add_argument("board")
     c.add_argument("task_id")
@@ -285,6 +337,8 @@ def _main(argv: list[str]) -> int:
         n = sync(repo, broot, args.board)
         print(f"kanban_git: synced ({n} changed file(s))")
         return 0
+    if args.cmd == "maintenance":
+        return maintenance(repo)
     return 0
 
 
