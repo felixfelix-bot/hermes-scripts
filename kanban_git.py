@@ -197,9 +197,29 @@ def import_status(repo: Path, boards_root: Path, only: str | None = None,
     return changes
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args],
-                          capture_output=True, text=True)
+# Hard wall-clock bound for every git invocation. The 2026-10-06 x240 incident
+# was a `git pull --rebase` that wedged for >1h holding a rebase + auto-gc,
+# feeding an inode blowup. A network git op must never run unbounded.
+GIT_TIMEOUT_S = int(os.environ.get("KANBAN_GIT_TIMEOUT_S", "120"))
+
+
+def _git(repo: Path, *args: str, timeout: int | None = None) -> subprocess.CompletedProcess:
+    if timeout is None:
+        timeout = GIT_TIMEOUT_S
+    try:
+        return subprocess.run(["git", "-C", str(repo), *args],
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        err = exc.stderr
+        if isinstance(err, bytes):
+            err = err.decode(errors="replace")
+        return subprocess.CompletedProcess(
+            ["git", "-C", str(repo), *args], 124,
+            out or "",
+            (err or "") + f"\nkanban_git: git {' '.join(args)} timed out after {timeout}s")
 
 
 def sync(repo: Path, boards_root: Path, only: str | None = None) -> int:
@@ -212,7 +232,16 @@ def sync(repo: Path, boards_root: Path, only: str | None = None) -> int:
         _git(repo, "-c", "user.name=hermes-kanban", "-c",
              "user.email=kanban@orangesync.tech",
              "commit", "-q", "-m", f"kanban: sync {time.strftime('%FT%TZ', time.gmtime())}")
-    _git(repo, "pull", "--rebase", "--autostash")  # best-effort
+    r = _git(repo, "pull", "--rebase", "--autostash")  # best-effort
+    if r.returncode != 0 and (
+        (repo / ".git" / "rebase-merge").exists()
+        or (repo / ".git" / "rebase-apply").exists()
+    ):
+        # A failed/timed-out rebase leaves the repo mid-rebase and blocks every
+        # later sync. Abort it (--autostash restores the working tree) so the
+        # next run starts clean, and surface it on stderr.
+        _git(repo, "rebase", "--abort", timeout=30)
+        print(f"kanban_git: aborted a stuck rebase in {repo}", file=sys.stderr)
     _git(repo, "push")                              # best-effort
     return written
 
