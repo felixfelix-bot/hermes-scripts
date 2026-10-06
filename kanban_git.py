@@ -42,6 +42,26 @@ DEFAULT_CLAIM_TTL = 3600
 # forward-only status order (lower = earlier). Unknown statuses fall back to -1.
 STATUS_ORDER = {"todo": 0, "triage": 0, "ready": 1, "running": 2,
                 "blocked": 2, "done": 3, "failed": 3, "cancelled": 3}
+# Runtime-only columns never materialized from the shared repo: a task pulled
+# onto a fresh node must be unclaimed/unstarted locally.
+RUNTIME_NULL_COLS = {"worker_pid", "claim_lock", "claim_expires",
+                     "last_heartbeat_at", "current_run_id"}
+
+
+def _hermes_bin() -> str:
+    b = os.environ.get("HERMES_BIN")
+    if b and Path(b).exists():
+        return b
+    # Install layouts differ across nodes (venv/bin, nested .hermes/bin, ~/.local/bin).
+    for p in (
+        HERMES / "hermes-agent" / "venv" / "bin" / "hermes",
+        HERMES / "hermes-agent" / ".hermes" / "bin" / "hermes",
+        Path(os.path.expanduser("~/.local/bin/hermes")),
+        Path("/usr/local/bin/hermes"),
+    ):
+        if p.exists():
+            return str(p)
+    return "hermes"
 
 
 def _read_json(p: Path, default=None):
@@ -109,7 +129,9 @@ def export(repo: Path, boards_root: Path, only: str | None = None) -> int:
             if not tid:
                 continue
             t["_board"] = board
-            t["_exported_at"] = int(time.time())
+            # No per-export timestamp here: a volatile ``_exported_at`` made
+            # every sync rewrite all ~6.5k task files (17M-object history
+            # bloat, 2026-10-06). The sync time lives in the commit message.
             dest = bdir / "tasks" / f"{tid}.json"
             if _read_json(dest) != t:
                 _write_json_atomic(dest, t)
@@ -197,6 +219,110 @@ def import_status(repo: Path, boards_root: Path, only: str | None = None,
     return changes
 
 
+def materialize(repo: Path, boards_root: Path, only: str | None = None,
+                apply: bool = False) -> dict:
+    """Create boards + tasks on this node from the shared repo (ADR-013).
+
+    The counterpart to ``export`` for a node that does not have the board yet:
+    creates the board via the official CLI (real schema/registry) and inserts
+    tasks with ``INSERT OR IGNORE`` (local edits never clobbered). Runtime-only
+    columns are forced inactive so a pulled task is never pre-claimed.
+    Dry-run by default. Returns ``{boards_created, tasks_created, skipped}``.
+    """
+    stats = {"boards_created": 0, "tasks_created": 0, "skipped": 0}
+    root = repo / "boards"
+    if not root.is_dir():
+        return stats
+    for bdir in sorted(root.iterdir()):
+        slug = bdir.name
+        if not bdir.is_dir() or (only and slug != only):
+            continue
+        tdir = bdir / "tasks"
+        if not tdir.is_dir():
+            continue
+        target = boards_root / slug
+        db = target / "kanban.db"
+        board_json = _read_json(bdir / "board.json", {}) or {}
+        if not db.exists():
+            stats["boards_created"] += 1
+            if not apply:
+                stats["tasks_created"] += len(list(tdir.glob("*.json")))
+                continue
+            name = board_json.get("name") or slug
+            cmd = [_hermes_bin(), "kanban", "boards", "create", slug, "--name", name]
+            if board_json.get("description"):
+                cmd += ["--description", str(board_json["description"])]
+            if board_json.get("default_workdir"):
+                cmd += ["--default-workdir", str(board_json["default_workdir"])]
+            subprocess.run(cmd, capture_output=True, text=True)
+            if not db.exists():  # fallback: init the schema directly
+                target.mkdir(parents=True, exist_ok=True)
+                subprocess.run([_hermes_bin(), "kanban", "--board", slug, "init"],
+                               capture_output=True, text=True)
+            if board_json:
+                _write_json_atomic(target / "board.json", board_json)
+        if not db.exists():
+            stats["skipped"] += 1
+            continue
+        con = sqlite3.connect(str(db))
+        try:
+            # Never collide with the gateway's own writer: WAL + a long busy
+            # timeout. A fresh board is created then populated in one pass; the
+            # gateway may open it concurrently, so these pragmas matter.
+            con.execute("PRAGMA busy_timeout=30000")
+            con.execute("PRAGMA journal_mode=WAL")
+            cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
+            for f in sorted(tdir.glob("*.json")):
+                rec = _read_json(f, {}) or {}
+                if not rec.get("id") or not rec.get("title") or not rec.get("status"):
+                    stats["skipped"] += 1
+                    continue
+                data = {k: v for k, v in rec.items()
+                        if k in cols and k not in RUNTIME_NULL_COLS}
+                if "workspace_kind" in cols and not data.get("workspace_kind"):
+                    data["workspace_kind"] = "scratch"
+                if not apply:
+                    exists = con.execute("SELECT 1 FROM tasks WHERE id=?",
+                                         (rec["id"],)).fetchone()
+                    if not exists:
+                        stats["tasks_created"] += 1
+                    continue
+                placeholders = ",".join("?" for _ in data)
+                cur = con.execute(
+                    f"INSERT OR IGNORE INTO tasks({','.join(data)}) VALUES({placeholders})",
+                    list(data.values()))
+                if cur.rowcount:
+                    stats["tasks_created"] += 1
+                # Heal urgency metadata on a task that was inserted before the
+                # urgency columns existed (INSERT OR IGNORE skips it), and
+                # release cards parked by the urgency_required gate solely
+                # because they were unclassified.
+                if "urgency" in cols and rec.get("urgency") is not None:
+                    sets = {"urgency": rec.get("urgency")}
+                    for k in ("urgency_deadline", "urgency_set_at", "urgency_source"):
+                        if k in cols and rec.get(k) is not None:
+                            sets[k] = rec.get(k)
+                    cur = con.execute(
+                        "UPDATE tasks SET " + ",".join(f"{k}=?" for k in sets)
+                        + " WHERE id=? AND urgency IS NULL",
+                        (*sets.values(), rec["id"]))
+                    if cur.rowcount:
+                        stats["healed"] = stats.get("healed", 0) + 1
+                        if "urgency_source" in cols:
+                            con.execute(
+                                "UPDATE tasks SET status='ready' "
+                                "WHERE id=? AND status='scheduled' "
+                                "AND urgency_source='urgency-unclassified'",
+                                (rec["id"],))
+            if apply:
+                con.commit()
+        except sqlite3.Error:
+            stats["skipped"] += 1
+        finally:
+            con.close()
+    return stats
+
+
 # Hard wall-clock bound for every git invocation. The 2026-10-06 x240 incident
 # was a `git pull --rebase` that wedged for >1h holding a rebase + auto-gc,
 # feeding an inode blowup. A network git op must never run unbounded.
@@ -226,23 +352,29 @@ def sync(repo: Path, boards_root: Path, only: str | None = None) -> int:
     if not (repo / ".git").exists():
         print(f"kanban_git: {repo} is not a git repo", file=sys.stderr)
         return 2
+    # Materialize any board this node is missing before exporting (ADR-013).
+    materialize(repo, boards_root, only, apply=True)
     written = export(repo, boards_root, only)
     _git(repo, "add", "-A")
     if _git(repo, "diff", "--cached", "--quiet").returncode != 0:
         _git(repo, "-c", "user.name=hermes-kanban", "-c",
              "user.email=kanban@orangesync.tech",
              "commit", "-q", "-m", f"kanban: sync {time.strftime('%FT%TZ', time.gmtime())}")
-    r = _git(repo, "pull", "--rebase", "--autostash")  # best-effort
+    # Pull explicitly from origin/<branch>: a fresh node has no upstream tracking,
+    # so a bare `git pull` fails and the node would diverge on an empty history.
+    _git(repo, "fetch", "origin")  # best-effort
+    branch = (_git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout or "master").strip() or "master"
+    r = _git(repo, "pull", "--rebase", "--autostash", "origin", branch)  # best-effort
     if r.returncode != 0 and (
         (repo / ".git" / "rebase-merge").exists()
         or (repo / ".git" / "rebase-apply").exists()
     ):
         # A failed/timed-out rebase leaves the repo mid-rebase and blocks every
         # later sync. Abort it (--autostash restores the working tree) so the
-        # next run starts clean, and surface it on stderr.
+        # next run starts clean.
         _git(repo, "rebase", "--abort", timeout=30)
         print(f"kanban_git: aborted a stuck rebase in {repo}", file=sys.stderr)
-    _git(repo, "push")                              # best-effort
+    _git(repo, "push", "origin", branch)  # best-effort
     return written
 
 
@@ -267,6 +399,7 @@ def maintenance(repo: Path) -> int:
         return "?"
 
     before = _count_loose()
+
     gc_pid = gitdir / "gc.pid"
     if gc_pid.exists():
         try:
@@ -279,6 +412,7 @@ def maintenance(repo: Path) -> int:
         else:
             print(f"kanban_git: gc.pid fresh (age {int(age)}s); skipping gc")
             return 0
+
     packdir = gitdir / "objects" / "pack"
     for pat in ("tmp_pack_*", ".tmp-*"):
         for p in list(packdir.glob(pat)):
@@ -287,6 +421,7 @@ def maintenance(repo: Path) -> int:
                 print(f"kanban_git: removed leftover {p.name}")
             except OSError:
                 pass
+
     r = _git(repo, "gc", "--prune=now", "--quiet",
              timeout=int(os.environ.get("KANBAN_GIT_GC_TIMEOUT_S", "1800")))
     if r.returncode != 0:
@@ -302,10 +437,11 @@ def _main(argv: list[str]) -> int:
     ap.add_argument("--repo", default=None)
     ap.add_argument("--boards-root", default=None)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("export", "import", "sync"):
+    for name in ("export", "import", "sync", "materialize"):
         s = sub.add_parser(name)
         s.add_argument("--board", default=None)
     sub.choices["import"].add_argument("--apply", action="store_true")
+    sub.choices["materialize"].add_argument("--apply", action="store_true")
     sub.add_parser("maintenance")
     c = sub.add_parser("claim")
     c.add_argument("board")
@@ -332,6 +468,12 @@ def _main(argv: list[str]) -> int:
     if args.cmd == "import":
         n = import_status(repo, broot, args.board, apply=args.apply)
         print(f"kanban_git: {n} status change(s){' applied' if args.apply else ' (dry-run)'}")
+        return 0
+    if args.cmd == "materialize":
+        st = materialize(repo, broot, args.board, apply=args.apply)
+        print(f"kanban_git: materialize (dry-run)" if not args.apply else "kanban_git: materialize")
+        print(f"  boards_created={st['boards_created']} tasks_created={st['tasks_created']} "
+              f"healed={st.get('healed',0)} skipped={st['skipped']}")
         return 0
     if args.cmd == "sync":
         n = sync(repo, broot, args.board)
