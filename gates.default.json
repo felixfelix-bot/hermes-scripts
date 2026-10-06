@@ -58,7 +58,7 @@
       }
     },
     "delivery": {
-      "_comment": "D-144 (2026-10-05): delivery-only cards publish an artifact instead of shipping code, so code gates (tests_green, ci_evidence, consolidated) are unsatisfiable. A done card was re-dispatched every 10 minutes for exactly this reason, burning a worker session per pass on a merged deliverable.",
+      "_comment": "D-144 (2026-10-05): delivery-only cards publish an artifact instead of shipping code, so code gates (tests_green, ci_evidence, consolidated) are unsatisfiable. A done card was re-dispatched every 10 minutes for exactly this reason, burning a worker session per pass on a merged deliverable. HARDENED 2026-10-06: `delivery_evidence` reads ONLY the card result + comments written after completion, never the aggregate blob (which leads with the card's own 'post it to <URL>' instructions), and only credits host-anchored URLs on hosts that could resolve. `delivery`/`evidence` are no longer tags — they are ordinary English words, and one line of body text must not skip the code tier.",
       "enforce": "block",
       "coverage_threshold": 0,
       "require": [
@@ -84,9 +84,7 @@
     "read-only": "recon",
     "inventory": "recon",
     "delivery-only": "delivery",
-    "delivery": "delivery",
-    "evidence-only": "delivery",
-    "evidence": "delivery"
+    "evidence-only": "delivery"
   },
   "board_tiers": {},
   "task_waivers": {
