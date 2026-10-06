@@ -198,12 +198,123 @@ RE_FULL_REVIEW = re.compile(r"FULL_REVIEW\s*[:=]\s*(\S+)", re.I)
 # delivery_evidence (D-144): the delivery-tier counterpart of ci_evidence.
 # A code card proves it passes CI; a delivery-only card has no code to prove, so
 # it must prove the artifact PUBLISHED somewhere a human can open — a PR comment
-# or review, a release, a blob/commit, or a raw file URL. Prose asserting
+# or review, a release, a blob/commit, or a raw artifact URL. Prose asserting
 # "delivered" is not evidence.
-RE_DELIVERED_URL = re.compile(
-    r"https?://\S*(?:/pull/\d+|#issuecomment-\d+|#discussion_r\d+|"
-    r"/releases?/|/blob/|/commit/|raw\.githubusercontent\.com|\S+\.(?:mp4|png|webm))",
-    re.I)
+#
+# HARDENED 2026-10-06 (cold cross-family review of PR #10, merged 2ac12fd). The
+# first version was ONE regex applied to the AGGREGATE evidence blob (result +
+# the last 30 comments) and it credited three things it must not:
+#   * the card's own INSTRUCTIONS — "post the evidence to <PR URL>" is a
+#     sentence about what to do, and the card D-144 exists for is exactly that
+#     shape, so the gate was satisfied by the URL in its own task text (the
+#     `/pull/1` incident card was one dispatch away from false credit);
+#   * a FAILURE report — "could not post to …/pull/12" matched `/pull/\d+`;
+#   * `\S+\.(?:mp4|png|webm)` unanchored, so `http://a.png` and any bare
+#     filename matched, and `…invalid/x/blob/y` credited the `/blob/` branch.
+# The shape now: a host-anchored URL with a real path, on a host that could
+# resolve, evaluated ONLY against `delivery_evidence_text()`.
+RE_DELIVERY_URL = re.compile(
+    r"https?://(?P<host>(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,})"
+    r"(?::\d+)?(?P<path>/[^\s<>\"')\]]*)", re.I)
+
+# The path shapes only a PUBLISHED artifact carries.
+RE_DELIVERY_PATH = re.compile(
+    r"/pull/\d+|/releases?(?:/|$)|/blob/|/commit/|/issues?/\d+|/discussions?/\d+"
+    r"|/\S+\.(?:mp4|webm|mov|mkv|png|jpe?g|webp)(?:$|[?#])", re.I)
+
+# Hosts that can never name a published artifact: the RFC-2606 documentation
+# names (example/invalid/localhost), the RFC-6761 special-use TLDs, and a host
+# whose last label is a FILE EXTENSION — `https://a.png/x.mp4` is the tell, and
+# it is the class the review's `http://a.png` counterexample belongs to. Same
+# fail-safe rule RE_CONSOLIDATED already applies to merge URLs.
+RE_PLACEHOLDER_HOST = re.compile(
+    r"(?:^|\.)(?:example|invalid|localhost)(?:\.|$)"
+    r"|\.(?:local|test|internal)$"
+    r"|\.(?:mp4|webm|mov|mkv|png|jpe?g|webp|gif|txt|md)$", re.I)
+
+# A URL carrying a format placeholder is a documented SHAPE, not a link.
+RE_TEMPLATED_URL = re.compile(r"%s|\$\{|<[A-Za-z_]|\{[A-Za-z_]|\.\.\.")
+
+# Raw-content hosts: the artifact IS the path, so there is no /blob/-style
+# marker to look for — only "a path deep enough to name a file".
+RE_RAW_CONTENT_HOST = re.compile(
+    r"^(?:raw\.githubusercontent\.com|raw\.github\.com|"
+    r"objects\.githubusercontent\.com)$", re.I)
+
+
+# A URL quoted inside a FAILURE report is not evidence: "Blocked: could not post
+# to …/pull/12 — the token lacks write access" names exactly the URL a success
+# would, so the URL shape alone cannot tell them apart — the LINE the URL sits
+# on has to be read. Scoped to that one line on purpose, so a refusal narrated
+# elsewhere in a long comment cannot disarm a real assertion (same rule as
+# RE_CONSOLIDATED).
+RE_DELIVERY_NEGATION = re.compile(
+    r"\b(?:could ?n[o']?t|could not|cannot|can'?t|unable to|failed to|failure|"
+    r"blocked|denied|refused|no write access|"
+    r"not (?:posted|published|delivered|uploaded|attached|committed))\b", re.I)
+
+
+def _line_around(text: str, pos: int) -> str:
+    """The single line containing ``pos`` (no trailing newline)."""
+    start = text.rfind("\n", 0, pos) + 1
+    end = text.find("\n", pos)
+    return text[start:] if end == -1 else text[start:end]
+
+
+def delivery_evidence_present(text: str) -> bool:
+    """True when ``text`` carries a URL that proves an artifact was PUBLISHED.
+
+    Regex-only by design: this runs per tick for every board and must never make
+    a network call. Residual limit, stated not implied — a hand-typed
+    bogus-but-plausible host (``https://acme-notreal.com/x.mp4``) is not
+    detectable without a DNS/HTTP lookup and is NOT caught here. What IS caught
+    is the classes the review falsified: a filename with no host at all, a host
+    that cannot resolve, a templated URL, and a URL quoted inside the failure
+    report that says it was NOT posted.
+    """
+    text = text or ""
+    for m in RE_DELIVERY_URL.finditer(text):
+        if RE_TEMPLATED_URL.search(m.group(0)):
+            continue
+        if RE_DELIVERY_NEGATION.search(_line_around(text, m.start())):
+            continue
+        host = m.group("host") or ""
+        path = m.group("path") or ""
+        if RE_PLACEHOLDER_HOST.search(host):
+            continue
+        if RE_RAW_CONTENT_HOST.match(host) and path.count("/") >= 2:
+            return True
+        if RE_DELIVERY_PATH.search(path):
+            return True
+    return False
+
+
+def delivery_evidence_text(conn: sqlite3.Connection, task_id: str,
+                           result: str | None, completed_at) -> str:
+    """The surfaces a card CANNOT pre-fill: its own RESULT, plus the comments
+    written AFTER it completed.
+
+    Scoping is the fix for the review's first finding. The aggregate evidence
+    blob (``evidence_text``) leads with the card's own instructions, so a card
+    whose text says "post the evidence to <PR URL>" credited the delivery gate
+    with the sentence telling the worker what to do — which is precisely the
+    card D-144 was written for. A pre-completion comment is instruction surface
+    or work-in-progress; the RESULT, and any comment posted after completion,
+    are the card's claim that the artifact exists.
+    """
+    parts = [result or ""]
+    cut = _to_epoch(completed_at)
+    if cut:
+        try:
+            for body, created in conn.execute(
+                    "select coalesce(body,''), created_at from task_comments"
+                    " where task_id=?", (task_id,)):
+                c = _to_epoch(created)
+                if c and c > cut:
+                    parts.append(body or "")
+        except sqlite3.Error:
+            pass
+    return "\n".join(parts)
 
 # A *published* review: a concrete GitHub PR review or comment URL for the PR
 # under review (e.g. .../pull/1318 or .../pull/1318#issuecomment-5691681965).
@@ -941,7 +1052,8 @@ def evaluate(tier: str, text: str, author_model: str,
              review_benchmark_floor: bool | None = None,
              secrets_hits: list | None = None, pr_branch: bool | None = None,
              live_drift: list | None = None,
-             playbook_check: bool | None = None) -> dict:
+             playbook_check: bool | None = None,
+             delivery_text: str | None = None) -> dict:
     """Return {tier, verdict, passed, missing, cross_family}."""
     g = gates or load_gates()
     if g.get("__spec_error__"):
@@ -962,8 +1074,14 @@ def evaluate(tier: str, text: str, author_model: str,
     # a card whose whole job is "post the thing". gate_tick then blocked a `done`
     # card, the offload layer re-ran it, it finished `done` again, and the cycle
     # repeated every tick at priority 85, burning a worker session each pass.
+    #
+    # Deliberately scoped (see delivery_evidence_text) and FAIL CLOSED: the
+    # aggregate blob leads with the card's own instructions, so reading it here
+    # would credit the gate with the sentence "post the evidence to <PR URL>".
+    # A caller that passes nothing therefore gets `missing`, never a pass.
     if "delivery_evidence" in require:
-        (passed if RE_DELIVERED_URL.search(text) else missing).append("delivery_evidence")
+        (passed if delivery_evidence_present(delivery_text or "")
+         else missing).append("delivery_evidence")
 
     ci = ci_result
     if "ci_evidence" in require and ci_required:
@@ -1066,6 +1184,11 @@ def evaluate_task(board: str, task_id: str, gates: dict | None = None) -> dict:
         title, assignee, result, completed_at, created_at = row
         text = evidence_text(conn, task_id, result)
         tags = board_tags(conn, task_id, gates)
+        # delivery_evidence is scoped to what the card CANNOT pre-fill: its own
+        # RESULT plus comments written after completion (see
+        # delivery_evidence_text). Never the aggregate blob above, which leads
+        # with the card's own instructions.
+        delivery = delivery_evidence_text(conn, task_id, result, completed_at)
     finally:
         conn.close()
     tier = classify_tier(board, tags, gates)
@@ -1145,7 +1268,8 @@ def evaluate_task(board: str, task_id: str, gates: dict | None = None) -> dict:
                    review_artifact=ra, review_published=rp,
                    consolidated=consolidated, review_benchmark_floor=rbf,
                    secrets_hits=secrets_hits,
-                   pr_branch=pr_branch, playbook_check=playbook_check)
+                   pr_branch=pr_branch, playbook_check=playbook_check,
+                   delivery_text=delivery)
     res.update({"board": board, "id": task_id, "title": title, "assignee": assignee,
                 "ci_evidence": ev, "ci": ci, "ci_required": True,
                 "review_artifact": ra, "review_published": rp,
