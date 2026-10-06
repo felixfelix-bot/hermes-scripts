@@ -56,6 +56,19 @@
         "required": false,
         "cross_family": false
       }
+    },
+    "delivery": {
+      "_comment": "D-144 (2026-10-05): delivery-only cards publish an artifact instead of shipping code, so code gates (tests_green, ci_evidence, consolidated) are unsatisfiable. A done card was re-dispatched every 10 minutes for exactly this reason, burning a worker session per pass on a merged deliverable.",
+      "enforce": "block",
+      "coverage_threshold": 0,
+      "require": [
+        "delivery_evidence",
+        "secrets_clean"
+      ],
+      "review": {
+        "required": false,
+        "cross_family": false
+      }
     }
   },
   "tag_tiers": {
@@ -69,7 +82,11 @@
     "recon": "recon",
     "measurement": "recon",
     "read-only": "recon",
-    "inventory": "recon"
+    "inventory": "recon",
+    "delivery-only": "delivery",
+    "delivery": "delivery",
+    "evidence-only": "delivery",
+    "evidence": "delivery"
   },
   "board_tiers": {},
   "task_waivers": {

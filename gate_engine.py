@@ -195,6 +195,16 @@ MANDATORY_CODE_GATES = ("ci_evidence", "review_artifact", "review_published",
 
 RE_FULL_REVIEW = re.compile(r"FULL_REVIEW\s*[:=]\s*(\S+)", re.I)
 
+# delivery_evidence (D-144): the delivery-tier counterpart of ci_evidence.
+# A code card proves it passes CI; a delivery-only card has no code to prove, so
+# it must prove the artifact PUBLISHED somewhere a human can open — a PR comment
+# or review, a release, a blob/commit, or a raw file URL. Prose asserting
+# "delivered" is not evidence.
+RE_DELIVERED_URL = re.compile(
+    r"https?://\S*(?:/pull/\d+|#issuecomment-\d+|#discussion_r\d+|"
+    r"/releases?/|/blob/|/commit/|raw\.githubusercontent\.com|\S+\.(?:mp4|png|webm))",
+    re.I)
+
 # A *published* review: a concrete GitHub PR review or comment URL for the PR
 # under review (e.g. .../pull/1318 or .../pull/1318#issuecomment-5691681965).
 RE_GH_PR_URL = re.compile(
@@ -945,6 +955,15 @@ def evaluate(tier: str, text: str, author_model: str,
         (passed if _has(RE_TEST, text) else missing).append("tests_green")
     if "pushed_or_consolidated" in require:
         (passed if RE_PUSH.search(text) else missing).append("pushed_or_consolidated")
+
+    # delivery_evidence (D-144): a delivery-only card must show a PUBLISHED
+    # artifact URL. Without this the card inherited the code tier and was asked
+    # for tests_green/ci_evidence/consolidated — structurally unsatisfiable for
+    # a card whose whole job is "post the thing". gate_tick then blocked a `done`
+    # card, the offload layer re-ran it, it finished `done` again, and the cycle
+    # repeated every tick at priority 85, burning a worker session each pass.
+    if "delivery_evidence" in require:
+        (passed if RE_DELIVERED_URL.search(text) else missing).append("delivery_evidence")
 
     ci = ci_result
     if "ci_evidence" in require and ci_required:
