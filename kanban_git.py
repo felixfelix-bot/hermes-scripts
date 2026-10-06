@@ -13,16 +13,32 @@ any node can dispatch independently **without duplicate work**:
             local SQLite, conservatively (status-only; never touch a task that
             is running/claimed locally). Default is dry-run.
   sync    — export -> git commit -> pull --rebase -> push.
+            Self-limiting: after a successful push, if the mirror has grown past
+            the auto-compact thresholds (commits > 200, packs > 10, or size >
+            200 MB) it squashes the local history to ONE commit (the current
+            tree) and force-pushes the result. If ``pull --rebase`` fails
+            because a peer rewrote the remote history (non-fast-forward), it
+            falls back to ``git fetch`` + ``git reset --hard origin/<branch>``
+            — safe because the worktree is regenerated from board DBs on every
+            export — and continues, logging which path was taken.
+  compact — collapse the mirror history into ONE commit holding the CURRENT
+            tree, using bare-repo-safe plumbing (``git commit-tree`` +
+            ``git update-ref`` + ``git reflog expire`` + ``git gc``). Never
+            uses ``git checkout``, so it works on a bare repo (the peer-host
+            mirror has no worktree). Prints before/after object+pack+size.
 
 The kanban state repo is separate from hermes-orchestration so task churn never
-pollutes code history. Config: ``~/.hermes/bot/kanban_git.json``
+pollutes code history. History of a state mirror has no value — only the
+current tree matters (the 2026-10-06 2.5 GB / 18M-object bloat was pure append
+history), hence compact + auto-compact. Config: ``~/.hermes/bot/kanban_git.json``
 ``{"repo": "~/hermes-kanban", "boards_root": "~/.hermes/kanban/boards"}``.
 
 CLI:
-  kanban_git.py export [--board B] [--repo R] [--boards-root P]
-  kanban_git.py claim  <board> <task_id> [--node N] [--ttl S] [--repo R]
-  kanban_git.py import [--board B] [--apply] [--repo R] [--boards-root P]
-  kanban_git.py sync   [--board B] [--repo R] [--boards-root P]
+  kanban_git.py export  [--board B] [--repo R] [--boards-root P]
+  kanban_git.py claim   <board> <task_id> [--node N] [--ttl S] [--repo R]
+  kanban_git.py import  [--board B] [--apply] [--repo R] [--boards-root P]
+  kanban_git.py sync    [--board B] [--repo R] [--boards-root P]
+  kanban_git.py compact [--repo R]
 """
 from __future__ import annotations
 
@@ -364,6 +380,7 @@ def sync(repo: Path, boards_root: Path, only: str | None = None) -> int:
     # so a bare `git pull` fails and the node would diverge on an empty history.
     _git(repo, "fetch", "origin")  # best-effort
     branch = (_git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout or "master").strip() or "master"
+    path = "rebase"
     r = _git(repo, "pull", "--rebase", "--autostash", "origin", branch)  # best-effort
     if r.returncode != 0 and (
         (repo / ".git" / "rebase-merge").exists()
@@ -374,8 +391,150 @@ def sync(repo: Path, boards_root: Path, only: str | None = None) -> int:
         # next run starts clean.
         _git(repo, "rebase", "--abort", timeout=30)
         print(f"kanban_git: aborted a stuck rebase in {repo}", file=sys.stderr)
+    if r.returncode != 0:
+        # Divergence fallback: the remote history was rewritten by a peer's
+        # `compact` (non-fast-forward). Rebase cannot apply local history onto a
+        # rewritten base, so discard the local (regenerated) history and adopt
+        # the remote tip. Safe: the working tree is rebuilt from board DBs every
+        # export, so `git reset --hard` loses nothing but append commits.
+        fr = _git(repo, "reset", "--hard", f"origin/{branch}")
+        if fr.returncode == 0:
+            path = "reset"
+            print(f"kanban_git: pull --rebase diverged; fell back to "
+                  f"fetch+reset --hard origin/{branch}", file=sys.stderr)
     _git(repo, "push", "origin", branch)  # best-effort
+    # Self-limiting auto-compact: squash the mirror after a successful push when
+    # it has grown past the bloat thresholds (2026-10-06 x240 incident).
+    if should_auto_compact(repo):
+        print(f"kanban_git: auto-compact threshold exceeded; compacting {repo}",
+              file=sys.stderr)
+        compact(repo)
     return written
+
+
+def _gitdir(repo: Path) -> Path:
+    """Return the git directory for a repo, bare or not.
+
+    A non-bare repo has ``repo/.git``; a bare repo (the peer-host mirror) has its
+    git files directly under ``repo`` (a ``HEAD`` file, no ``.git``).
+    """
+    if (repo / ".git").exists():
+        return repo / ".git"
+    if (repo / "HEAD").exists():
+        return repo
+    return repo / ".git"  # fallback: caller will fail cleanly on is_git_repo
+
+
+def _is_git_repo(repo: Path) -> bool:
+    return (repo / ".git").exists() or (repo / "HEAD").exists()
+
+
+def compact(repo: Path) -> int:
+    """Collapse the mirror history into ONE commit holding the CURRENT tree.
+
+    Bare-repo-safe plumbing (``git commit-tree`` + ``git update-ref``), never
+    ``git checkout`` — the peer-host mirror has no worktree. History of a state
+    mirror has no value; only the current tree matters. Returns 0 on success,
+    non-zero on failure.
+    """
+    if not _is_git_repo(repo):
+        print(f"kanban_git: {repo} is not a git repo", file=sys.stderr)
+        return 2
+    branch = (_git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout
+              or "master").strip() or "master"
+    tree = (_git(repo, "rev-parse", f"{branch}^{{tree}}").stdout or "").strip()
+    if not tree:
+        print(f"kanban_git: compact: no tree for branch {branch!r}", file=sys.stderr)
+        return 1
+    before = _repo_stats(repo)
+    new_sha = (_git(repo, "-c", "user.name=hermes-kanban", "-c",
+                    "user.email=kanban@orangesync.tech",
+                    "commit-tree", tree, "-m",
+                    f"board sync (history squashed {time.strftime('%FT%TZ', time.gmtime())})")
+               .stdout or "").strip()
+    if not new_sha:
+        print("kanban_git: compact: commit-tree produced no commit", file=sys.stderr)
+        return 1
+    _git(repo, "update-ref", f"refs/heads/{branch}", new_sha)
+    _git(repo, "reflog", "expire", "--expire=now", "--all")
+    _git(repo, "gc", "--prune=now", "--quiet")
+    after = _repo_stats(repo)
+    print(f"kanban_git: compact {branch}: "
+          f"objects {before['objects']}->{after['objects']}, "
+          f"packs {before['packs']}->{after['packs']}, "
+          f"size {before['size_mb']}->{after['size_mb']} MB")
+    return 0
+
+
+def _repo_stats(repo: Path) -> dict:
+    """Lightweight repo weight snapshot: loose+packed objects, packs, size MB."""
+    stats = {"objects": "?", "packs": "?", "size_mb": "?"}
+    p = _git(repo, "count-objects", "-vH", timeout=60)
+    for line in (p.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("count:"):
+            stats["objects"] = line.split(":", 1)[1].strip()
+        elif line.startswith("in-pack:"):
+            stats["objects"] = line.split(":", 1)[1].strip()
+        elif line.startswith("packs:"):
+            stats["packs"] = line.split(":", 1)[1].strip()
+    try:
+        stats["size_mb"] = str(round(_gitdir_size_mb(repo), 1))
+    except OSError:
+        stats["size_mb"] = "?"
+    return stats
+
+
+def _gitdir_size_mb(repo: Path) -> float:
+    """Total size of the repo's git dir in MiB (loose objects + packs)."""
+    gitdir = _gitdir(repo)
+    total = 0
+    for root, _dirs, files in os.walk(gitdir):
+        for f in files:
+            fp = Path(root) / f
+            try:
+                total += fp.stat().st_size
+            except OSError:
+                continue
+    return total / (1024 * 1024)
+
+
+def _commit_count(repo: Path) -> int:
+    """Number of commits reachable from HEAD (mirror history length)."""
+    p = _git(repo, "rev-list", "--count", "HEAD", timeout=60)
+    try:
+        return int((p.stdout or "").strip() or 0)
+    except ValueError:
+        return 0
+
+
+def _pack_count(repo: Path) -> int:
+    """Number of pack files in the repo (a proxy for gc churn)."""
+    packdir = _gitdir(repo) / "objects" / "pack"
+    if not packdir.is_dir():
+        return 0
+    return len(list(packdir.glob("*.pack")))
+
+
+# Auto-compact thresholds (2026-10-06 x240): a state mirror should stay tiny.
+AUTO_COMPACT_COMMITS = 200
+AUTO_COMPACT_PACKS = 10
+AUTO_COMPACT_SIZE_MB = 200.0
+
+
+def should_auto_compact(repo: Path) -> bool:
+    """True when the mirror has grown past any auto-compact threshold.
+
+    Pure decision over measured repo weight; the thresholds are module constants
+    so the boundary tests can pin them exactly.
+    """
+    try:
+        size_mb = _gitdir_size_mb(repo)
+    except OSError:
+        size_mb = 0.0
+    return (_commit_count(repo) > AUTO_COMPACT_COMMITS
+            or _pack_count(repo) > AUTO_COMPACT_PACKS
+            or size_mb > AUTO_COMPACT_SIZE_MB)
 
 
 def maintenance(repo: Path) -> int:
@@ -443,6 +602,7 @@ def _main(argv: list[str]) -> int:
     sub.choices["import"].add_argument("--apply", action="store_true")
     sub.choices["materialize"].add_argument("--apply", action="store_true")
     sub.add_parser("maintenance")
+    sub.add_parser("compact")
     c = sub.add_parser("claim")
     c.add_argument("board")
     c.add_argument("task_id")
@@ -481,6 +641,8 @@ def _main(argv: list[str]) -> int:
         return 0
     if args.cmd == "maintenance":
         return maintenance(repo)
+    if args.cmd == "compact":
+        return compact(repo)
     return 0
 
 
