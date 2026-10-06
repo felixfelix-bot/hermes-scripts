@@ -23,13 +23,13 @@ def touch_triage():
 DEFAULT_SOON_H = 6
 OFFPEAK = set(range(22, 24)) | set(range(0, 6))  # UTC hours
 
-def log(msg):
+def log(msg, stream=None):
     line = f"[{time.strftime('%FT%TZ', time.gmtime())}] {msg}"
     try:
         os.makedirs(os.path.dirname(LOG), exist_ok=True)
         with open(LOG, "a") as f: f.write(line + "\n")
     except Exception: pass
-    print(msg)  # cron captures stdout
+    print(msg, file=stream)  # default stdout; gate_create sends diagnostics to stderr
 
 def alert(msg):
     subprocess.run(["logger", "-t", "urgency-gate", "--", f"ALERT {msg}"],
@@ -234,7 +234,12 @@ def stamp(board, r, lvl, deadline, source):
         conn.commit()
         return ids
     ids = sql(board, w) or []
-    log(f"classified {ids} @ {board} -> {lvl} (deadline={deadline}, {source})")
+    # stdout for ``gate_create`` is the machine-readable JSON contract (the real
+    # CLI is always called with --json). A diagnostic line on stdout made every
+    # ``json.loads(create --json)`` parser fail, so route it to stderr; the file
+    # log via ``log`` is unchanged.
+    log(f"classified {ids} @ {board} -> {lvl} (deadline={deadline}, {source})",
+        stream=sys.stderr)
 
 def gate_dispatch(argv):
     board = resolve_board(argv)

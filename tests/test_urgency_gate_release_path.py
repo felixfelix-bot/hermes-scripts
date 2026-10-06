@@ -20,9 +20,13 @@ Run:
     python3 -m unittest discover -s tests -v
 """
 
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -177,6 +181,46 @@ class TestTickEnrolledDispatch(_Base):
         self.set_tier("cheap")
         self.ug.tick()
         self.assertIn("unblock", self.verbs())
+
+
+class TestGateCreateStdoutPurity(_Base):
+    """``gate_create`` stdout is the machine-readable JSON contract.
+
+    Regression for 2026-10-06: ``stamp()`` logged ``classified [...] -> soon``
+    to stdout *before* the real CLI's JSON, so every ``json.loads(create --json)``
+    parser failed (the one-shot av-review cron reported 6/6 creates failed and
+    then exited 0). The diagnostic must go to stderr.
+    """
+
+    def test_create_json_stdout_has_no_diagnostic_prefix(self):
+        self.add_task("t_created", "ready")
+        diagnostics = []
+
+        def capture_log(msg, stream=None):
+            diagnostics.append(msg)
+            print(msg, file=stream if stream is not None else sys.stdout)
+
+        self.ug.log = capture_log
+        proc = _FakeProc()
+        proc.stdout = json.dumps({"id": "t_created", "status": "ready"})
+        self.ug.run_real = lambda args: proc
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.ug.gate_create(
+                ["--board", "b", "--urgency", "soon", "--body", "x", "title"]
+            )
+
+        self.assertEqual(rc, 0)
+        # stdout must be PURE JSON, parseable by the callers that broke.
+        self.assertEqual(
+            json.loads(out.getvalue()),
+            {"id": "t_created", "status": "ready"},
+        )
+        self.assertNotIn("classified", out.getvalue())
+        # ...and the diagnostic still reaches stderr + the log sink.
+        self.assertIn("classified", err.getvalue())
+        self.assertTrue(any("classified" in m for m in diagnostics))
 
 
 if __name__ == "__main__":
