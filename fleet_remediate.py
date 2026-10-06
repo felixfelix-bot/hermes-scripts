@@ -226,10 +226,103 @@ def act_rollback(reason: str) -> str:
         return f"rollback error: {exc}"
 
 
+# ── resync-kanban feedback-loop guards (2026-10-06) ─────────────────────────
+# The board repo is a *state mirror*; a health->remediation loop kept re-triggering
+# syncs on repo *weight* (objects/packs/size), never on whether the board content
+# had actually changed. Two independent guards break that loop:
+#   1. rate limit — min 15 min between runs AND max 8 runs / rolling 24h.
+#   2. content freshness — a resync is only "needed" when some board DB is newer
+#      than the last successful sync (mtime), never when the repo is heavy.
+RESYNC_MIN_INTERVAL_S = 900
+RESYNC_MAX_PER_24H = 8
+RESYNC_WINDOW_S = 86400
+RESYNC_RATELIMIT_STATE = BOT / "kanban_resync_ratelimit.json"
+KANBAN_GIT_STATE = BOT / "kanban_git_state.json"
+
+
+def _resync_rate_limited(runs, now, min_interval_s=RESYNC_MIN_INTERVAL_S,
+                         max_per_24h=RESYNC_MAX_PER_24H,
+                         window_s=RESYNC_WINDOW_S):
+    """Decide whether a resync must be skipped. Returns (blocked, reason).
+
+    Pure over an explicit ``now`` and a list of prior run timestamps so the
+    boundary tests are deterministic.
+    """
+    if runs and (now - runs[-1]) < min_interval_s:
+        return True, "min-interval"
+    recent = [t for t in runs if (now - t) <= window_s]
+    if len(recent) >= max_per_24h:
+        return True, "24h-cap"
+    return False, ""
+
+
+def _load_resync_runs(path=RESYNC_RATELIMIT_STATE):
+    st = _read_json(path, {}) or {}
+    runs = st.get("runs", [])
+    if isinstance(runs, list):
+        return [float(t) for t in runs]
+    return []
+
+
+def _record_resync_run(path, runs, now):
+    runs = [t for t in runs if (now - t) <= RESYNC_WINDOW_S] + [now]
+    _write_json(path, {"runs": runs, "last_run_ts": now})
+
+
+def _board_db_newest_mtime(boards_root):
+    """Newest mtime across all board kanban.db files, or 0.0 if none exist."""
+    newest = 0.0
+    if boards_root.is_dir():
+        for db in boards_root.glob("*/kanban.db"):
+            try:
+                newest = max(newest, db.stat().st_mtime)
+            except OSError:
+                continue
+    return newest
+
+
+def _last_sync_ts(state_path=KANBAN_GIT_STATE):
+    st = _read_json(state_path, {}) or {}
+    try:
+        return float(st.get("ts", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _content_is_stale(boards_root, last_sync_ts, now=None):
+    """True when board content is newer than the last successful sync.
+
+    Content-based, never repo-weight based: compares the newest ``kanban.db``
+    mtime against the last successful sync timestamp. No boards -> not stale.
+    """
+    newest = _board_db_newest_mtime(boards_root)
+    if newest == 0.0:
+        return False
+    return newest > last_sync_ts
+
+
 def act_resync_kanban(reason: str) -> str:
     script = HERMES / "scripts" / "kanban_git.py"
     if not script.exists():
         return "resync-kanban: kanban_git.py missing"
+    now = time.time()
+    boards_root = HERMES / "kanban" / "boards"
+
+    # 1. Rate limit: min interval + rolling 24h cap, persisted to disk.
+    runs = _load_resync_runs()
+    blocked, why = _resync_rate_limited(runs, now)
+    if blocked:
+        _write_json(RESYNC_RATELIMIT_STATE,
+                    {"runs": runs, "last_run_ts": now,
+                     "skipped": {"ts": now, "reason": why}})
+        return f"resync-kanban: skipped (rate-limited: {why})"
+
+    # 2. Content freshness: no resync when the boards are already synced.
+    last_sync = _last_sync_ts()
+    if not _content_is_stale(boards_root, last_sync, now):
+        _record_resync_run(RESYNC_RATELIMIT_STATE, runs, now)
+        return "resync-kanban: skipped (content fresh; no board DB newer than last sync)"
+
     env = dict(os.environ)
     # Bulk board commits hang on the legacy class-pattern scan (~6.8k task files).
     env["HERMES_LEGACY_PATTERN_SCAN"] = "off"
@@ -244,10 +337,17 @@ def act_resync_kanban(reason: str) -> str:
             head = rr.stdout.strip()
         except Exception:
             pass
-        _write_json(BOT / "kanban_git_state.json",
-                    {"ts": time.time(), "rc": r.returncode, "head": head})
+        if r.returncode == 0:
+            _write_json(KANBAN_GIT_STATE, {"ts": time.time(), "rc": 0, "head": head})
+        else:
+            # Keep the last good ts so a failing sync does not mask real staleness,
+            # but record the failure for visibility.
+            _write_json(KANBAN_GIT_STATE,
+                        {"ts": _last_sync_ts(), "rc": r.returncode, "head": head})
+        _record_resync_run(RESYNC_RATELIMIT_STATE, runs, now)
         return f"resync-kanban rc={r.returncode} {r.stdout.strip()[:100]}"
     except Exception as exc:  # noqa: BLE001
+        _record_resync_run(RESYNC_RATELIMIT_STATE, runs, now)
         return f"resync-kanban error: {exc}"
 
 
