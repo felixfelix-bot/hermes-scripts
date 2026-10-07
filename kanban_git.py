@@ -126,7 +126,17 @@ def _db_tasks(db: Path) -> list[dict]:
         rows = []
     finally:
         con.close()
-    return [dict(r) for r in rows]
+    # SQLite columns may be BLOB; a task ``body`` stored as bytes makes
+    # ``json.dumps`` fail in ``export`` (2026-10-07: two boards carried a blob
+    # body and the whole sync died with "Object of type bytes is not JSON
+    # serializable"). Decode any bytes to text (replace) so the state mirror is
+    # always JSON-serializable.
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        out.append({k: (v.decode("utf-8", "replace") if isinstance(v, bytes) else v)
+                    for k, v in d.items()})
+    return out
 
 
 def export(repo: Path, boards_root: Path, only: str | None = None) -> int:
@@ -403,6 +413,11 @@ def sync(repo: Path, boards_root: Path, only: str | None = None) -> int:
             print(f"kanban_git: pull --rebase diverged; fell back to "
                   f"fetch+reset --hard origin/{branch}", file=sys.stderr)
     _git(repo, "push", "origin", branch)  # best-effort
+    # Drop any autostash left by `pull --rebase --autostash`: leftover stash
+    # entries pin old history reachable, defeat compact/gc, and accumulate
+    # (2026-10-07: 3 leftover autostash entries pinned ~5.7M objects and the
+    # mirror could not be pruned back to its ~7k-object working set).
+    _git(repo, "stash", "clear")
     # Self-limiting auto-compact: squash the mirror after a successful push when
     # it has grown past the bloat thresholds (2026-10-06 x240 incident).
     if should_auto_compact(repo):
@@ -457,7 +472,12 @@ def compact(repo: Path) -> int:
         return 1
     _git(repo, "update-ref", f"refs/heads/{branch}", new_sha)
     _git(repo, "reflog", "expire", "--expire=now", "--all")
-    _git(repo, "gc", "--prune=now", "--quiet")
+    # Memory-bounded gc: disable delta search so pruning a large mirror cannot
+    # OOM. 2026-10-07: plain `git gc` on 15.5M objects hit a 1.9G peak and was
+    # OOM-killed; with pack.window=0/pack.depth=0 the same prune ran in ~20s at
+    # ~20MB RSS and took the mirror from 1.9 GB to 9 MB.
+    _git(repo, "-c", "pack.window=0", "-c", "pack.depth=0",
+         "gc", "--prune=now", "--quiet")
     after = _repo_stats(repo)
     print(f"kanban_git: compact {branch}: "
           f"objects {before['objects']}->{after['objects']}, "
@@ -581,7 +601,8 @@ def maintenance(repo: Path) -> int:
             except OSError:
                 pass
 
-    r = _git(repo, "gc", "--prune=now", "--quiet",
+    r = _git(repo, "-c", "pack.window=0", "-c", "pack.depth=0",
+             "gc", "--prune=now", "--quiet",
              timeout=int(os.environ.get("KANBAN_GIT_GC_TIMEOUT_S", "1800")))
     if r.returncode != 0:
         print(f"kanban_git: gc failed rc={r.returncode}: {(r.stderr or '').strip()[:200]}",
