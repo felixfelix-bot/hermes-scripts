@@ -497,6 +497,283 @@ def playbook_check_present(text: str) -> bool:
     return bool(RE_PLAYBOOK_OK.search(strip_code_fences(text or "")))
 
 
+# Gate 2.10 — pcb_review / pcb_consult circuit-board evidence gates.
+# Trigger: the card's first `tags:` line names a PCB-related word.
+PCB_TAG_WORDS = frozenset({"pcb", "schematic", "board", "kicad",
+                           "layout", "fab", "gerber"})
+RE_PCB_TAG_DECL = re.compile(r"^[ \t>*+\-#]*tags?[ \t]*[:=][ \t]*(.+)$",
+                             re.I | re.M)
+
+# Evidence lines. Format:
+#   pcb_review: verdict=... reviewer_model=... reviewer_profile=... artifact=...
+#               drc=... erc=... netlist_parity=...
+#   pcb_consult: verdict=... reviewer_model=... reviewer_profile=... artifact=...
+RE_PCB_REVIEW_LINE = re.compile(r"^[ \t]*pcb_review\s*:\s*(.+)$", re.I | re.M)
+RE_PCB_CONSULT_LINE = re.compile(r"^[ \t]*pcb_consult\s*:\s*(.+)$", re.I | re.M)
+# key=value or key:value pairs. Values may be single/double quoted; unquoted
+# values stop at the next whitespace or comma. Deliberately narrow: a malformed
+# field is a fail-closed validation error.
+RE_PCB_KV = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s,]+))",
+    re.I)
+
+RE_TIER_ALIAS = re.compile(r"^tier/", re.I)
+RE_URL_LIKE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
+
+
+def playbook_check_present(text: str) -> bool:
+    """True when the card carries the pre-merge playbook check's own verdict.
+
+    Fenced code is stripped first so a *quoted* evidence line cannot credit the
+    gate (same hardening as pr_branch_naming / consolidated).
+    """
+    return bool(RE_PLAYBOOK_OK.search(strip_code_fences(text or "")))
+
+
+def pcb_tagged(text: str) -> bool:
+    """True when the first `tags:` line names a PCB-related word (Gate 2.10).
+
+    Only the FIRST declaration counts, mirroring tier classification: a later
+    line cannot re-tag a card. Fenced code is stripped so quoted source cannot
+    trigger the gate.
+    """
+    m = RE_PCB_TAG_DECL.search(strip_code_fences(text or ""))
+    if not m:
+        return False
+    value = m.group(1).lower()
+    return any(re.search(rf"\b{re.escape(w)}\b", value) for w in PCB_TAG_WORDS)
+
+
+def pcb_evidence_text(conn: sqlite3.Connection, task_id: str,
+                      result: str | None, completed_at) -> str:
+    """Surfaces a PCB card CANNOT pre-fill: result + post-completion comments.
+
+    The task body is instruction surface; a card that says "write
+    pcb_review: ..." must not satisfy the gate with its own instructions.
+    The result, and any comment posted at or after completion, are the
+    card's claim that the review/consult actually happened.
+    """
+    parts = [result or ""]
+    cut = _to_epoch(completed_at)
+    if cut:
+        try:
+            for body, created in conn.execute(
+                    "select coalesce(body,''), created_at from task_comments"
+                    " where task_id=?", (task_id,)):
+                c = _to_epoch(created)
+                # >= cut: completing and commenting often land in the same second.
+                if c and c >= cut:
+                    parts.append(body or "")
+        except sqlite3.Error:
+            pass
+    return "\n".join(parts)
+
+
+def _parse_pcb_line(pattern: re.Pattern, text: str) -> dict | None:
+    """Return key=value dict from the first matching `pcb_*:` line, or None."""
+    m = pattern.search(text or "")
+    if not m:
+        return None
+    payload = m.group(1)
+    out: dict = {}
+    for key, v1, v2, v3 in RE_PCB_KV.findall(payload):
+        value = v1 or v2 or v3
+        if value is not None:
+            out[key.lower()] = value
+    return out if out else None
+
+
+def _format_pcb_review(verdict: str, reviewer_model: str, reviewer_profile: str,
+                       artifact: str, drc: str, erc: str,
+                       netlist_parity: str) -> str:
+    return (
+        f"pcb_review: verdict={verdict} reviewer_model={reviewer_model} "
+        f"reviewer_profile={reviewer_profile} artifact={artifact} "
+        f"drc={drc} erc={erc} netlist_parity={netlist_parity}"
+    )
+
+
+def _format_pcb_consult(verdict: str, reviewer_model: str, reviewer_profile: str,
+                        artifact: str) -> str:
+    return (
+        f"pcb_consult: verdict={verdict} reviewer_model={reviewer_model} "
+        f"reviewer_profile={reviewer_profile} artifact={artifact}"
+    )
+
+
+def _artifact_ok(value: str) -> tuple[bool, str | None]:
+    """Validate a PCB artifact value. Returns (ok, reason_or_None)."""
+    if not value:
+        return False, "missing required field artifact"
+    if RE_URL_LIKE.match(value):
+        return True, None
+    p = Path(os.path.expanduser(value))
+    try:
+        if not p.exists():
+            return False, f"artifact path does not exist: {value}"
+        if not p.is_file():
+            return False, f"artifact path is not a file: {value}"
+        size = p.stat().st_size
+        if size < 100:
+            return False, f"artifact file too small ({size} bytes): {value}"
+    except OSError as exc:
+        return False, f"artifact path unreadable: {value} ({exc})"
+    return True, None
+
+
+def _is_concrete_model(model: str) -> tuple[bool, str | None]:
+    """Reject tier/* aliases and the bare tier name these profiles repeat."""
+    if not model:
+        return False, "missing required field reviewer_model"
+    if RE_TIER_ALIAS.search(model):
+        return False, f"reviewer_model must be concrete, not tier alias: {model}"
+    # The PCB reviewer/consultant profiles carry tier/schematic-review. A value
+    # that merely repeats the tier name is not a concrete served id.
+    if model.lower() == "schematic-review":
+        return False, f"reviewer_model must be concrete, not tier name: {model}"
+    return True, None
+
+
+def _int_field(value: str, name: str) -> tuple[int | None, str | None]:
+    """Parse an integer gate field; reject placeholders/empty."""
+    if value is None:
+        return None, f"missing required field {name}"
+    v = str(value).strip()
+    if not v:
+        return None, f"missing required field {name}"
+    if v.lower() in ("-", "?", "n/a", "tbd"):
+        return None, f"{name} must be an integer, got placeholder: {v}"
+    try:
+        return int(v), None
+    except ValueError:
+        return None, f"{name} must be an integer: {v}"
+
+
+def _netlist_parity_ok(value: str | None) -> tuple[bool, str | None]:
+    if not value:
+        return False, "missing required field netlist_parity"
+    v = value.strip().lower()
+    if v == "ok":
+        return True, None
+    if re.match(r"^diff:\d+$", v):
+        return True, None
+    return False, f"netlist_parity must be 'ok' or 'diff:<int>', got: {value}"
+
+
+def _verdict_ok(value: str | None, name: str = "verdict") -> tuple[bool, str | None]:
+    if not value:
+        return False, f"missing required field {name}"
+    if value.upper() in ("APPROVED", "CHANGES_REQUESTED"):
+        return True, None
+    return False, f"{name} must be APPROVED or CHANGES_REQUESTED, got: {value}"
+
+
+def pcb_review_present(text: str, author_model: str,
+                       gates: dict | None = None) -> dict:
+    """Validate the first `pcb_review:` evidence line. Returns {ok, reason, model}.
+
+    Fail-closed: every required field must be present and valid; the reviewer
+    must be from a different model family than the author; the reviewer_model
+    must be a concrete served id, never a tier/* alias or bare tier name.
+    """
+    parsed = _parse_pcb_line(RE_PCB_REVIEW_LINE, text)
+    if parsed is None:
+        return {"ok": False, "reason": "missing pcb_review evidence line",
+                "model": None}
+
+    ok, reason = _verdict_ok(parsed.get("verdict"))
+    if not ok:
+        return {"ok": False, "reason": reason, "model": None}
+
+    if parsed.get("reviewer_profile", "").lower() != "pcb-reviewer":
+        return {"ok": False,
+                "reason": f"reviewer_profile must be pcb-reviewer, got: "
+                          f"{parsed.get('reviewer_profile')}",
+                "model": None}
+
+    model = parsed.get("reviewer_model", "")
+    ok, reason = _is_concrete_model(model)
+    if not ok:
+        return {"ok": False, "reason": reason, "model": model}
+
+    ok, reason = _artifact_ok(parsed.get("artifact", ""))
+    if not ok:
+        return {"ok": False, "reason": f"pcb_review: {reason}", "model": model}
+
+    drc, reason = _int_field(parsed.get("drc"), "drc")
+    if reason:
+        return {"ok": False, "reason": f"pcb_review: {reason}", "model": model}
+
+    erc, reason = _int_field(parsed.get("erc"), "erc")
+    if reason:
+        return {"ok": False, "reason": f"pcb_review: {reason}", "model": model}
+
+    ok, reason = _netlist_parity_ok(parsed.get("netlist_parity"))
+    if not ok:
+        return {"ok": False, "reason": f"pcb_review: {reason}", "model": model}
+
+    g = gates or load_gates()
+    author_fam = family(author_model, g)
+    reviewer_fam = family(model, g)
+    if reviewer_fam == author_fam or reviewer_fam == "unknown":
+        return {"ok": False,
+                "reason": f"pcb_review: reviewer family {reviewer_fam} must differ "
+                          f"from author family {author_fam}",
+                "model": model}
+
+    return {"ok": True, "reason": None, "model": model}
+
+
+def pcb_consult_present(text: str, author_model: str, review_model: str,
+                        gates: dict | None = None) -> dict:
+    """Validate the first `pcb_consult:` evidence line. Returns {ok, reason, model}.
+
+    The consultant must be a COLD consult: different family from both the
+    pcb_review reviewer and the author. Concrete model id required.
+    """
+    parsed = _parse_pcb_line(RE_PCB_CONSULT_LINE, text)
+    if parsed is None:
+        return {"ok": False, "reason": "missing pcb_consult evidence line",
+                "model": None}
+
+    ok, reason = _verdict_ok(parsed.get("verdict"))
+    if not ok:
+        return {"ok": False, "reason": reason, "model": None}
+
+    if parsed.get("reviewer_profile", "").lower() != "pcb-consultant":
+        return {"ok": False,
+                "reason": f"reviewer_profile must be pcb-consultant, got: "
+                          f"{parsed.get('reviewer_profile')}",
+                "model": None}
+
+    model = parsed.get("reviewer_model", "")
+    ok, reason = _is_concrete_model(model)
+    if not ok:
+        return {"ok": False, "reason": reason, "model": model}
+
+    ok, reason = _artifact_ok(parsed.get("artifact", ""))
+    if not ok:
+        return {"ok": False, "reason": f"pcb_consult: {reason}", "model": model}
+
+    g = gates or load_gates()
+    author_fam = family(author_model, g)
+    consult_fam = family(model, g)
+    if consult_fam == author_fam or consult_fam == "unknown":
+        return {"ok": False,
+                "reason": f"pcb_consult: consultant family {consult_fam} must differ "
+                          f"from author family {author_fam}",
+                "model": model}
+    if review_model:
+        review_fam = family(review_model, g)
+        if consult_fam == review_fam:
+            return {"ok": False,
+                    "reason": f"pcb_consult: consultant family {consult_fam} "
+                              f"must differ from reviewer family {review_fam}",
+                    "model": model}
+
+    return {"ok": True, "reason": None, "model": model}
+
+
 def _names_other_ref(suffix: str) -> bool:
     """True when the text AFTER an asserted slug names a *different* branch/ref.
 
@@ -1076,6 +1353,9 @@ def evaluate(tier: str, text: str, author_model: str,
              secrets_hits: list | None = None, pr_branch: bool | None = None,
              live_drift: list | None = None,
              playbook_check: bool | None = None,
+             pcb_tagged: bool = False,
+             pcb_review: dict | None = None,
+             pcb_consult: dict | None = None,
              delivery_text: str | None = None) -> dict:
     """Return {tier, verdict, passed, missing, cross_family}."""
     g = gates or load_gates()
@@ -1183,6 +1463,19 @@ def evaluate(tier: str, text: str, author_model: str,
         paths = live_drift if live_drift is not None else live_drift_paths()
         (passed if not paths else missing).append("no_live_drift")
 
+    # Gate 2.10: circuit-board review/consult. Only applicable when the first
+    # `tags:` line names a PCB-related word (pcb/schematic/board/kicad/layout/
+    # fab/gerber). Untagged cards are unaffected.
+    if pcb_tagged:
+        if pcb_review is not None and pcb_review.get("ok"):
+            passed.append("pcb_review")
+        else:
+            missing.append("pcb_review")
+        if pcb_consult is not None and pcb_consult.get("ok"):
+            passed.append("pcb_consult")
+        else:
+            missing.append("pcb_consult")
+
     enforce = spec.get("enforce", "advisory")
     verdict = "pass" if not missing else ("block" if enforce == "block" else "warn")
     return {"tier": tier, "verdict": verdict, "passed": passed,
@@ -1211,6 +1504,11 @@ def evaluate_task(board: str, task_id: str, gates: dict | None = None) -> dict:
         # RESULT plus comments written after completion (see
         # delivery_evidence_text). Never the aggregate blob above, which leads
         # with the card's own instructions.
+        body_row = conn.execute(
+            "select coalesce(body,'') from tasks where id=?", (task_id,)).fetchone()
+        body = body_row[0] if body_row else ""
+        is_pcb_tagged = bool(pcb_tagged(result or "") or pcb_tagged(body or ""))
+        pcb_text = pcb_evidence_text(conn, task_id, result, completed_at)
         delivery = delivery_evidence_text(conn, task_id, result, completed_at)
     finally:
         conn.close()
@@ -1287,11 +1585,18 @@ def evaluate_task(board: str, task_id: str, gates: dict | None = None) -> dict:
     # is skipped in evaluate().
     playbook_check = (playbook_check_present(text)
                       if RE_PLAYBOOK_REF.search(text) else None)
+    # Gate 2.10: circuit-board review/consult. Trigger from the first tags: line;
+    # evidence only from result + comments at/after completion (body excluded).
+    pcb_review = pcb_review_present(pcb_text, author, gates) if is_pcb_tagged else None
+    review_model = (pcb_review.get("model") or "") if pcb_review else ""
+    pcb_consult = pcb_consult_present(pcb_text, author, review_model, gates) if is_pcb_tagged else None
     res = evaluate(tier, text, author, gates, ci_result=ci, ci_required=True,
                    review_artifact=ra, review_published=rp,
                    consolidated=consolidated, review_benchmark_floor=rbf,
                    secrets_hits=secrets_hits,
                    pr_branch=pr_branch, playbook_check=playbook_check,
+                   pcb_tagged=is_pcb_tagged, pcb_review=pcb_review,
+                   pcb_consult=pcb_consult,
                    delivery_text=delivery)
     res.update({"board": board, "id": task_id, "title": title, "assignee": assignee,
                 "ci_evidence": ev, "ci": ci, "ci_required": True,
@@ -1300,6 +1605,9 @@ def evaluate_task(board: str, task_id: str, gates: dict | None = None) -> dict:
                 "secrets_hits": secrets_hits,
                 "pr_branch_naming": pr_branch,
                 "playbook_check": playbook_check,
+                "pcb_tagged": is_pcb_tagged,
+                "pcb_review": pcb_review,
+                "pcb_consult": pcb_consult,
                 "completed_at": completed_at, "created_at": created_at,
                 "enforce_since_ts": since})
     return res
