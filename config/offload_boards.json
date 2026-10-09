@@ -1,0 +1,10 @@
+{
+  "_comment": "Boards opted into the PRIVATE fleet offload ledger (config-as-code). install-offload-optin.sh merges this into ~/.hermes/bot/fleet_map/private_offload_boards.json. Private transport = a peer may claim the card; sensitive bodies never go to the public bus (ADR/Phase W2).",
+  "private_offload": {
+    "contextvm-services": {
+      "repo": "https://github.com/cvm-services/contextvm-services.git",
+      "private": true,
+      "note": "facilitated orders + ContextVM services (Felix, 2026-10-09). Board repo is on GitHub; peers must have it cloned or the card advertises requires=repo:contextvm-services and strands as unfit."
+    }
+  }
+}
