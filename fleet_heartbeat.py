@@ -259,8 +259,8 @@ def _ssh_base(key: str | None) -> list[str]:
 def _classify(host: str) -> str:
     """Label a peer address by link type.
 
-    Preference order (Phase V3.2): LAN > FIPS > NetBird > other — keep fleet
-    traffic off the metered WAN wherever a local path exists.
+    Preference order (operator 2026-10-09): FIPS > LAN > NetBird > other —
+    the mesh address survives off-site; LAN is the fast local fallback.
     """
     if host.startswith("192.168.") or host.endswith(".local"):
         return "lan"
@@ -271,7 +271,24 @@ def _classify(host: str) -> str:
     return "other"
 
 
-_LINK_RANK = {"lan": 0, "fips": 1, "netbird": 2, "other": 3}
+# OPERATOR 2026-10-09: FIPS-first. The mesh address is stable and works
+# whether or not nodes share a physical LAN (mDNS .local and DHCP IPv4
+# leases rot the moment a machine leaves site). LAN stays as fast fallback.
+# Overridable: FLEET_LINK_RANK="lan,fips,netbird,other" restores old order.
+_LINK_RANK = {"fips": 0, "lan": 1, "netbird": 2, "other": 3}
+
+
+def _apply_env_rank_override() -> None:
+    import os
+    spec = os.environ.get("FLEET_LINK_RANK", "")
+    if not spec:
+        return
+    for i, name in enumerate([s.strip() for s in spec.split(",") if s.strip()]):
+        if name in _LINK_RANK:
+            _LINK_RANK[name] = i
+
+
+_apply_env_rank_override()
 
 
 def _order_hosts(candidates: list[str], last: str | None = None) -> list[str]:
