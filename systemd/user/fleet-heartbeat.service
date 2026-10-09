@@ -1,0 +1,13 @@
+[Unit]
+Description=Hermes fleet heartbeat (publish node capacity + fit to peers)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=90
+ExecStart=@PYTHON@ %h/.hermes/scripts/fleet_heartbeat.py --push
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Sample node resources every 5 min
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=300
+AccuracySec=30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

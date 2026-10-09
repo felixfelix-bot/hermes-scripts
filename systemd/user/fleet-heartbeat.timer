@@ -1,0 +1,13 @@
+[Unit]
+Description=Publish Hermes fleet heartbeat every 30s
+
+[Timer]
+OnBootSec=15
+OnActiveSec=15
+OnUnitActiveSec=30
+AccuracySec=5
+RandomizedDelaySec=5
+Persistent=true
+
+[Install]
+WantedBy=timers.target
