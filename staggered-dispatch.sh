@@ -61,7 +61,10 @@ SLEEP_BETWEEN="${SLEEP_BETWEEN:-30}"      # seconds between board passes
 FAILURE_LIMIT="${FAILURE_LIMIT:-5}"
 STATE_DIR="${STATE_DIR:-$HOME/.hermes/state}"
 GATE_FILE="${GATE_FILE:-$STATE_DIR/rate_limit_gate.json}"
-BOARDS="${BOARDS:-fips infrastructure hermes-for-friends}"
+# Board list is config-as-code (config/dispatch_policy.json). Fall back to the
+# historical default only if the gate/config is unavailable.
+BOARDS="${BOARDS:-$([ -x "$DISPATCH_GATE" ] && "$DISPATCH_GATE" --boards 2>/dev/null | tr '\n' ' ')}"
+[ -z "$BOARDS" ] && BOARDS="fips infrastructure hermes-for-friends"
 HERMES_BIN="${HERMES_BIN:-/home/c03rad0r/.hermes/hermes-agent/venv/bin/hermes}"
 KANBAN_BOARDS_ROOT="${KANBAN_BOARDS_ROOT:-$HOME/.hermes/kanban/boards}"
 # Quota-class pause reasons — the exact top-level reason prefixes
@@ -88,7 +91,10 @@ fi
 check_resources() {
     local label="$1" gate_json gate_rc
     if [ ! -x "$DISPATCH_GATE" ]; then
-        log "resource gate unavailable: $DISPATCH_GATE"
+        # Deliberate fail-CLOSED: an unguarded spawn on a memory-starved host is
+        # what got our workers oomd-killed. The alert makes a partial deploy loud
+        # instead of silently wedging dispatch. Install via install-dispatch-policy.sh.
+        alert "resource gate unavailable: $DISPATCH_GATE - dispatch blocked (fail-closed)"
         return 1
     fi
     gate_json=$("$DISPATCH_GATE" 2>/dev/null); gate_rc=$?
