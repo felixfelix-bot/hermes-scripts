@@ -1,0 +1,11 @@
+[Unit]
+Description=Fleet resource metrics collector (feeds multi_resource_kalman)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@PYTHON@ %h/.hermes/scripts/fleet_resource_collector.py
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target

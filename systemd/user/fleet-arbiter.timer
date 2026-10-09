@@ -1,0 +1,11 @@
+[Unit]
+Description=Run fleet arbiter every 2 min
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=120
+AccuracySec=15
+Persistent=true
+
+[Install]
+WantedBy=timers.target

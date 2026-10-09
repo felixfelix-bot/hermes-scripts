@@ -1,0 +1,13 @@
+[Unit]
+Description=Hermes fleet arbiter (symmetric remediation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@PYTHON@ %h/.hermes/scripts/fleet_arbiter.py --apply
+ExecStart=@PYTHON@ %h/.hermes/scripts/fleet_lkg.py maybe-good
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target
