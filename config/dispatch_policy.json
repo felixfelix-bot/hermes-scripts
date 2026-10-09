@@ -1,0 +1,8 @@
+{
+  "_comment": "Single dispatch policy for the fleet. Consumed by dispatch_gate.py; declared here so thresholds and the board list are reviewable config, not buried shell defaults.",
+  "boards": ["fips", "infrastructure", "hermes-for-friends", "contextvm-services"],
+  "max_load_per_cpu": 0.8,
+  "min_mem_available_mb": 1536,
+  "max_swap_used_pct": 90,
+  "stale_after_s": 120
+}
