@@ -53,13 +53,18 @@ alert() {
 }
 
 # --- Config (overridable via env) ---
-LOAD_THRESHOLD="${LOAD_THRESHOLD:-3.4}"
-RAM_MIN_MB="${RAM_MIN_MB:-1500}"          # 1.5 GB
+# Resource policy is centralized in dispatch_gate.py + config/dispatch_policy.json.
+# Keep legacy env names only as compatibility markers; thresholds are not read here.
+DISPATCH_GATE="${DISPATCH_GATE:-$HOME/.hermes/scripts/dispatch_gate.py}"
+RAM_MIN_MB="${RAM_MIN_MB:-1500}"          # legacy compatibility; gate policy owns floor
 SLEEP_BETWEEN="${SLEEP_BETWEEN:-30}"      # seconds between board passes
 FAILURE_LIMIT="${FAILURE_LIMIT:-5}"
 STATE_DIR="${STATE_DIR:-$HOME/.hermes/state}"
 GATE_FILE="${GATE_FILE:-$STATE_DIR/rate_limit_gate.json}"
-BOARDS="${BOARDS:-fips infrastructure hermes-for-friends}"
+# Board list is config-as-code (config/dispatch_policy.json). Fall back to the
+# historical default only if the gate/config is unavailable.
+BOARDS="${BOARDS:-$([ -x "$DISPATCH_GATE" ] && "$DISPATCH_GATE" --boards 2>/dev/null | tr '\n' ' ')}"
+[ -z "$BOARDS" ] && BOARDS="fips infrastructure hermes-for-friends"
 HERMES_BIN="${HERMES_BIN:-/home/c03rad0r/.hermes/hermes-agent/venv/bin/hermes}"
 KANBAN_BOARDS_ROOT="${KANBAN_BOARDS_ROOT:-$HOME/.hermes/kanban/boards}"
 # Quota-class pause reasons — the exact top-level reason prefixes
@@ -84,15 +89,18 @@ fi
 
 # --- Resource check helper (load + RAM) ---
 check_resources() {
-    local label="$1" load ram_avail load_ok ram_ok
-    load=$(awk '{print $1}' /proc/loadavg)
-    ram_avail=$(free -m | awk '/^Mem:/ {print $7}')
-    [ -z "${ram_avail:-}" ] && ram_avail=0
-    load_ok=$(awk -v l="$load" -v t="$LOAD_THRESHOLD" 'BEGIN{print (l+0 < t+0) ? 1 : 0}')
-    ram_ok=$(awk -v r="$ram_avail" -v m="$RAM_MIN_MB" 'BEGIN{print (r+0 > m+0) ? 1 : 0}')
-    log "resource check [$label]: load=$load ok=${load_ok}, avail_ram=${ram_avail}MB ok=${ram_ok}"
-    if [ "$load_ok" != "1" ] || [ "$ram_ok" != "1" ]; then
-        log "resource gate FAILED for [$label] (load=$load, ram=${ram_avail}MB) — stopping"
+    local label="$1" gate_json gate_rc
+    if [ ! -x "$DISPATCH_GATE" ]; then
+        # Deliberate fail-CLOSED: an unguarded spawn on a memory-starved host is
+        # what got our workers oomd-killed. The alert makes a partial deploy loud
+        # instead of silently wedging dispatch. Install via install-dispatch-policy.sh.
+        alert "resource gate unavailable: $DISPATCH_GATE - dispatch blocked (fail-closed)"
+        return 1
+    fi
+    gate_json=$("$DISPATCH_GATE" 2>/dev/null); gate_rc=$?
+    log "resource check [$label]: $gate_json"
+    if [ "$gate_rc" -ne 0 ]; then
+        log "resource gate FAILED for [$label]: $gate_json — stopping"
         return 1
     fi
     return 0
