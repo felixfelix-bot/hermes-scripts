@@ -1,42 +1,58 @@
 #!/usr/bin/env bash
-# install-offload-optin.sh - merge config/offload_boards.json into the live
-# fleet offload map (~/.hermes/bot/fleet_map/private_offload_boards.json).
+# install-offload-optin.sh - opt a board into PRIVATE fleet offload, durably.
 #
-# Config-as-code: the tracked config is the source of truth for extra boards we
-# opt into the PRIVATE offload ledger. Idempotent; atomic; keeps a backup.
+# WHY (2026-10-09): the offload opt-in map
+# (~/.hermes/bot/fleet_map/private_offload_boards.json) is DERIVED - the
+# classifier/materializer rebuilds it from ~/.hermes/bot/board_repos.json on
+# every cycle. Writing the derived map directly LOOKS like it works, then the
+# entry silently disappears on the next classify/materialize pass and the
+# board's cards stop being advertised to peers. So this installer writes the
+# UPSTREAM mapping (board -> repo) and lets the derivation carry it forward.
+#
+# Idempotent. --dry-run prints changes. HERMES_BOT overrides the bot dir.
 set -euo pipefail
+DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CFG="${OFFLOAD_CFG:-$HERE/config/offload_boards.json}"
-MAP="${FLEET_MAP:-$HOME/.hermes/bot/fleet_map/private_offload_boards.json}"
-[ -f "$CFG" ] || { echo "offload-optin: missing config $CFG" >&2; exit 1; }
-mkdir -p "$(dirname "$MAP")"
-python3 - "$CFG" "$MAP" <<'PY'
-import json, os, shutil, sys, tempfile
-cfg_p, map_p = sys.argv[1], sys.argv[2]
-cfg = json.load(open(cfg_p)).get("private_offload", {}) or {}
-live = {}
-if os.path.exists(map_p):
-    try: live = json.load(open(map_p)) or {}
-    except Exception: live = {}
-if not isinstance(live, dict): live = {}
-added, updated = [], []
+BOT="${HERMES_BOT:-$HOME/.hermes/bot}"
+CFG="$HERE/config/offload_boards.json"
+[ -f "$CFG" ] || { echo "ERROR: missing $CFG" >&2; exit 1; }
+
+python3 - "$CFG" "$BOT" "$DRY" <<'PY'
+import json, os, sys, urllib.parse
+cfg_p, bot, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+cfg = json.load(open(cfg_p))["private_offload"]
+def load(p):
+    try: return json.load(open(p))
+    except Exception: return {}
+# 1) upstream mapping: the thing that must survive
+repos_p = os.path.join(bot, "board_repos.json")
+repos = load(repos_p)
+added = []
 for board, meta in cfg.items():
-    entry = {k: v for k, v in meta.items() if k != "note"}
-    if board not in live:
+    slug = urllib.parse.urlparse(meta["repo"]).path.rstrip("/").removesuffix(".git").split("/")[-1]
+    if repos.get(board) != slug:
+        repos[board] = slug
         added.append(board)
-    elif live.get(board, {}).get("repo") != entry.get("repo"):
-        updated.append(board)
-    live[board] = {**live.get(board, {}), **entry}
-if not (added or updated):
-    print("offload-optin: already current (no change)")
-    sys.exit(0)
-if os.path.exists(map_p):
-    shutil.copy2(map_p, map_p + ".bak-offload-optin")
-d = os.path.dirname(map_p) or "."
-fd, tmp = tempfile.mkstemp(dir=d, prefix=".offload-", suffix=".json")
-with os.fdopen(fd, "w") as fh:
-    json.dump(live, fh, indent=1, sort_keys=True)
-    fh.write("\n")
-os.replace(tmp, map_p)
-print("offload-optin: added=%s updated=%s -> %s" % (added, updated, map_p))
+if dry:
+    print(f"DRY: would add to board_repos.json: {added}")
+else:
+    if added:
+        json.dump(repos, open(repos_p + ".tmp", "w"), indent=1)
+        os.replace(repos_p + ".tmp", repos_p)
+    print(f"board_repos.json: added={added} (now {len(repos)} boards)")
+# 2) derived opt-in: write now so it takes effect before the next derive cycle
+fm = os.path.join(bot, "fleet_map")
+os.makedirs(fm, exist_ok=True)
+opt_p = os.path.join(fm, "private_offload_boards.json")
+opt = load(opt_p)
+missed = []
+for board, meta in cfg.items():
+    if board not in opt:
+        opt[board] = {"repo": meta["repo"], "private": True}
+        missed.append(board)
+if not dry and missed:
+    json.dump(opt, open(opt_p + ".tmp", "w"), indent=1)
+    os.replace(opt_p + ".tmp", opt_p)
+print(f"private_offload_boards.json: added={missed} (now {len(opt)})")
 PY
+echo "verify: python3 -c \"import sys;sys.path.insert(0,'$HERE');import fleet_scheduler as f;print([(b, f._advertise_transport(b, f._load_map('public_boards.json'), f._load_map('private_offload_boards.json'), f._load_map('local_only_boards.json'))) for b in $(python3 -c "import json;print(list(json.load(open('$CFG'))['private_offload']))")])\""
