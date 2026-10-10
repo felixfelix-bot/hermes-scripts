@@ -38,6 +38,19 @@ HERMES = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
 BOT = HERMES / "bot"
 WRAPPER = HERMES / "scripts" / "kanban-crash-wrapper.sh"
 STATE = BOT / "fleet_queue_state.json"
+
+# Appended to every offload worker prompt. The worker's turn budget is a hard
+# cap; a cap-out must leave a pushed, resumable savepoint, not a dirty tree.
+# Mirrors state/worker-base/SOUL.md "Death-Proof Every Task".
+DEATHPROOF = (
+    "Death-proof the work: commit AND push after each verified milestone "
+    "(never leave more than ~15 tool-calls uncommitted); keep PROGRESS.md at the "
+    "worktree root (finding -> status -> files touched); write your FULL report "
+    "to REPORT.md BEFORE your final reply; if you run out of budget, state "
+    "exactly which step you stopped at and list the REMAINING steps as a "
+    "numbered list, and never claim a commit/push/test/PR you did not observe. "
+    "A short final reply pointing at the on-disk report is a success."
+)
 # Durable "already wrote back" ledger. The in-state `written_back` flag on an
 # advertised entry resets whenever the state file is purged/rebuilt (e.g. the
 # 2026-09-17 unfit-repo purge), which let replayed stale fleet-done events close
@@ -76,8 +89,54 @@ def _write(p, v):
     tmp.replace(p)
 
 
+def _stale_dispatch_frozen() -> bool:
+    """True if `.dispatch_frozen` exists but is stale per freeze_policy.json.
+
+    Defense-in-depth (2026-10-08): four nodes sat `.dispatch_frozen` for days
+    because their freeze-guard timer was disabled, so `_frozen()` blocked all
+    dispatch and the scheduler kept yielding work to nodes that never ran it.
+    A freeze older than the policy ttl (with stale_clear on) must not block.
+    """
+    p = BOT / ".dispatch_frozen"
+    if not p.exists():
+        return False
+    pol = _read(BOT / "freeze_policy.json", {}) or {}
+    if not pol.get("stale_clear", True):
+        return False
+    try:
+        ttl = int(pol.get("ttl_s", 1800))
+    except (TypeError, ValueError):
+        ttl = 1800
+    if ttl <= 0:
+        return False  # sticky freeze
+    try:
+        age = time.time() - p.stat().st_mtime
+    except OSError:
+        return False
+    return age > ttl
+
+
 def _frozen() -> bool:
-    return any(p.exists() for p in QUARANTINES)
+    # Hard markers, never auto-lifted: an operator ESTOP, an L6 quarantine, or
+    # an explicit offload disable.
+    if (HERMES / "ESTOP").exists() or (BOT / ".fleet_quarantine").exists():
+        return True
+    if (BOT / ".fleet_offload_disabled").exists():
+        return True
+    df = BOT / ".dispatch_frozen"
+    if df.exists():
+        if _stale_dispatch_frozen():
+            # Self-heal: the freeze-guard timer normally clears this; if it is
+            # disabled/absent, clear the stale marker here so dispatch resumes.
+            try:
+                df.unlink()
+                print("[fleet-sched] cleared stale .dispatch_frozen (age > ttl)",
+                      flush=True)
+            except OSError:
+                pass
+        else:
+            return True
+    return False
 
 
 def _hermes() -> str:
@@ -265,6 +324,49 @@ def advertise_local(state: dict) -> int:
     return n
 
 
+def _caps() -> dict:
+    """Per-dimension resource policy (mirrors fleet_arbiter.DEFAULTS)."""
+    caps = {"max_load_per_cpu": 0.8, "min_mem_available_mb": 1536,
+            "load_storm_per_cpu": 12.0, "max_workers": 4}
+    cfg = _read(BOT / "fleet.json", {}) or {}
+    caps.update(cfg.get("caps", {}) or {})
+    return caps
+
+
+def _peer_health_map(peers: "list[dict] | None") -> dict:
+    return {p["node"]: p for p in (peers or [])
+            if isinstance(p, dict) and p.get("node")}
+
+
+def _winner_holdable(winner: str, key: str, state: dict,
+                     peers: "list[dict] | None", health: dict,
+                     caps: dict) -> "tuple[bool, str]":
+    """t_dd8ff7ca: only hold a local card for a LIVE, HEALTHY, FIT winner.
+
+    A single saturated or unfit node must never brake the whole fleet. If the
+    winner is not demonstrably able to take the work, the card stays local
+    instead of being blocked (blocking propagates to every peer via kanban
+    sync, which is how one bad node denied work fleet-wide).
+    """
+    me = fq._self()
+    if winner == me:
+        return True, ""            # self is trivially live/healthy/fit
+    h = _peer_health_map(peers).get(winner)
+    if not h:
+        return False, "no-fresh-health"
+    load = float(h.get("load1_per_cpu", 0) or 0)
+    if load >= float(caps.get("load_storm_per_cpu", 12.0)):
+        return False, f"winner load/cpu {load} (storm)"
+    mem = float(h.get("mem_available_mb", 1e9) or 1e9)
+    if mem < float(caps.get("min_mem_available_mb", 1536)):
+        return False, f"winner mem {int(mem)}MB"
+    task = (state.get("tasks", {}) or {}).get(key) or {}
+    ok, why = fq.fit_ok(h.get("fit") or {}, task)
+    if not ok:
+        return False, f"winner unfit: {why}"
+    return True, ""
+
+
 def _hold_ttl() -> int:
     cfg = _balance_cfg()
     try:
@@ -354,7 +456,65 @@ def _card_holdable(board: str, tid: str) -> bool:
     return _card_status(board, tid) in _HOLDABLE_STATUSES
 
 
-def apply_holds(state: dict, winners: dict, now: float | None = None) -> int:
+def _db_in_flight(board: str, tid: str, now: float) -> bool:
+    """True when this node's board DB shows a live run for `tid`.
+
+    Read-only: `status='running'`, a non-NULL `current_run_id` (set at claim
+    time, i.e. before the worker is spawned), or a `worker_pid` that is still
+    alive. A genuinely queued card (ready, no run pointer, no live pid) is
+    still holdable — that is the whole point of the hold.
+    """
+    if not board or not tid:
+        return False
+    import sqlite3
+    dbs = (HERMES / "kanban" / "boards" / board / "kanban.db",
+           HERMES / "kanban" / "kanban.db")  # board DB, then the default board
+    for db in dbs:
+        if not db.exists():
+            continue
+        try:
+            c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                row = c.execute(
+                    "select status, current_run_id, worker_pid from tasks"
+                    " where id=?", (tid,)).fetchone()
+            finally:
+                c.close()
+        except Exception:  # noqa: BLE001 — unreadable DB: fall through (no claim)
+            continue
+        if not row:
+            return False
+        status, run_id, pid = row
+        if status == "running" or run_id is not None:
+            return True
+        if pid and fo._pid_alive(pid):
+            return True
+        return False
+    return False
+
+
+def _has_local_run(info: dict, now: float) -> bool:
+    """True when a LOCAL worker is already executing this advertised card.
+
+    Holding a card that is in flight is what dead-ended t_7027694a (board
+    plebeian-my-prs, 2026-09-19): `block` NULLs `current_run_id`, after which the
+    live session's run-id-guarded `complete`/`block`/`review` all refuse, so the
+    worker can only exit by skipping its terminal board call (t_81cb7a13).
+    Holds are for QUEUED cards; running work is never touched.
+    """
+    tid = str(info.get("task") or "")
+    if not tid:
+        return False
+    if tid in _running:                       # started by this scheduler
+        return True
+    if fo.live_lock(tid, ttl=_RUN_TTL):       # offload lock with a live pid
+        return True
+    return _db_in_flight(str(info.get("board") or ""), tid, now)
+
+
+def apply_holds(state: dict, winners: dict, now: float | None = None, *,
+                peers: "list[dict] | None" = None,
+                health: dict | None = None) -> int:
     """When hold is enabled, block the local copy of any advertised task that a
     winner (self or peer) is now responsible for, so the LOCAL dispatcher does
     not also run it. Reversible; local wins are set to review on reap.
@@ -364,11 +524,20 @@ def apply_holds(state: dict, winners: dict, now: float | None = None) -> int:
     A winner previously released for failing to ack stays denied until it
     publishes a fresh heartbeat — otherwise the very next tick would re-block
     the card we just freed.
+
+    t_dd8ff7ca: holds are **per-node and winner-aware**. A card is only held
+    for a winner that is demonstrably live, healthy and fit. Otherwise it stays
+    local — a single saturated node must never brake the fleet (a held card's
+    block propagates to every peer via kanban sync).
     """
     if not _hold_enabled():
         return 0
     now = now if now is not None else time.time()
     denied = state.setdefault("hold_denied", {})
+    skipped = state.setdefault("hold_skipped",
+                               {"unhealthy": 0, "unfit": 0, "no-health": 0})
+    skipped["unhealthy"] = skipped["unfit"] = skipped["no-health"] = 0
+    caps = _caps()
     n = 0
     for key, info in state.get("advertised", {}).items():
         if not isinstance(info, dict):
@@ -376,6 +545,17 @@ def apply_holds(state: dict, winners: dict, now: float | None = None) -> int:
         winner = winners.get(key)
         if not winner or info.get("held"):
             continue
+        if peers is not None:
+            holdable, why = _winner_holdable(winner, key, state, peers,
+                                             health or {}, caps)
+            if not holdable:
+                if "unfit" in why:
+                    skipped["unfit"] += 1
+                elif "health" in why:
+                    skipped["no-health"] += 1
+                else:
+                    skipped["unhealthy"] += 1
+                continue
         tid = info.get("task")
         # A terminal OR already-non-blockable card must not be held: `block`
         # would be rejected and `unblock` could never release it. Only skip
@@ -390,6 +570,11 @@ def apply_holds(state: dict, winners: dict, now: float | None = None) -> int:
         # Completion integrity: never offload-hold review work (it is local and
         # must publish; holding parks it and risks a silent done).
         if _is_review_task(info):
+            continue
+        # Holds are for QUEUED cards only. Blocking a card whose local worker is
+        # already in flight NULLs current_run_id, and that live session's
+        # run-id-guarded complete/block/review then all refuse (t_81cb7a13).
+        if _has_local_run(info, now):
             continue
         denied_for = denied.get(tid) or {}
         had_deny = bool(denied_for.get(winner))
@@ -409,6 +594,8 @@ def apply_holds(state: dict, winners: dict, now: float | None = None) -> int:
             info["held"] = winner
             info["held_ts"] = now
             n += 1
+    if any(skipped.values()):
+        print(f"[fleet-sched] hold skipped (winner not holdable): {skipped}")
     return n
 
 
@@ -507,9 +694,98 @@ def _started(state: dict, tid: str, node: str) -> bool:
                for e in (state.get("claims", {}) or {}).get(tid, []))
 
 
+def _sizing_note(task: dict, profile: str, log=print) -> None:
+    """Advisory: log when a card looks over its assignee's turn cap.
+
+    Never raises and never blocks dispatch — it only surfaces a likely cap-out
+    so the manager can split/scope. See scripts/fleet/task_sizing.py.
+    """
+    try:
+        import task_sizing as _ts  # noqa: PLC0415 (same dir, best-effort)
+        cap = _ts.profile_cap(profile)
+        a = _ts.assess(task.get("title", ""), task.get("body", ""), cap)
+        if a["over"]:
+            log(f"[fleet-sched] {task.get('id')} sizing: est ~{a['required']} "
+                f"turns > cap {a['cap']} ({a['kind']}, files={a['est_files']}, "
+                f"tests={a['est_tests']}) — consider splitting")
+    except Exception:  # noqa: BLE001 (advisory only)
+        pass
+
+
+def _offload_prompt(task: dict, wd, repo: str) -> str:
+    """Prompt for a fleet offload worker: task body + shipping discipline."""
+    return (
+        f"You are a fleet offload worker. Repo: {repo or task.get('board')}. "
+        f"Workspace: {wd}. Task: {task.get('title')}. "
+        f"{task.get('body', '')}\n\n"
+        f"Do the work with tools, then ship it. {DEATHPROOF}"
+    )
+
+
+def _run_env(tid: str, me: str, run_id: str) -> dict:
+    """Spawn env for an offload worker, with per-run session attribution.
+
+    Without HERMES_SESSION_ID the worker's loopback model calls reach the
+    router with no X-Hermes-Session header and land as unattributed burn
+    (session_id NULL): invisible to per-task cost accounting and a trigger for
+    attribution-burn-guard. Pin one id per (node, task, run) and override any
+    value inherited from the scheduler's own environment.
+    """
+    env = dict(
+        os.environ,
+        HERMES_FLEET_CAP=str(_offload_max()),
+        HERMES_SESSION_ID=f"fleet:{me}:{tid}:{run_id}",
+    )
+    # Do NOT export HERMES_KANBAN_TASK here. Setting it puts `hermes chat` into
+    # kanban-worker mode, which requires the worker to post a terminal board op
+    # (`complete`/`block`/`review`) and otherwise exits 78 (EX_CONFIG). But an
+    # offload worker's job is to DO the work and ship it — THIS scheduler writes
+    # the board back (see _write_back_local). Leaving the marker set made every
+    # offloaded card end rc=78 and get written back `blocked` (the 2026-10-09
+    # block-loop: "workers spawn, get killed on arrival").
+    env.pop("HERMES_KANBAN_TASK", None)
+    return env
+
+
+def _worker_argv(profile: str, prompt: str) -> list[str]:
+    """Argv for an offload worker.
+
+    Prefer the crash wrapper (it captures diagnostics and enforces the admission
+    gate), but fall back to the real hermes binary when it is absent. A node
+    that never had the wrapper installed otherwise fails EVERY offloaded card
+    with rc=127, which writes the card back to `blocked` — the 2026-10-09
+    fleet-load incident. The scheduler's own `len(_running) < cap` still bounds
+    concurrency when the wrapper is missing.
+    """
+    if WRAPPER.exists():
+        return ["bash", str(WRAPPER), "-p", profile, "chat", "-q", prompt]
+    return [_hermes(), "-p", profile, "chat", "-q", prompt]
+
+
+def _active_offload_pids() -> set[int]:
+    """PIDs of live offload workers on this node (from the per-task lock dir).
+
+    The concurrency cap must count these, not just this process's `_running`:
+    a scheduler restart empties `_running` but the workers keep running, so
+    without this a restart re-spawns up to `cap` more and the node
+    oversubscribes (2026-10-09: 19 workers on an 8-core x280).
+    """
+    pids: set[int] = set()
+    try:
+        for f in fo.LOCK_DIR.glob("*.json"):
+            rec = _read(f, {}) or {}
+            pid = rec.get("pid")
+            if pid and fo._pid_alive(pid):
+                pids.add(int(pid))
+    except Exception:  # noqa: BLE001
+        pass
+    return pids
+
+
 def execute(task: dict) -> None:
     tid = task["id"]
     profile = _profile_for(task)
+    _sizing_note(task, profile)
     repo = task.get("repo") or ""
     wd = Path.home() / "repos" / repo if repo else HERMES
     me = fq._self()
@@ -524,13 +800,9 @@ def execute(task: dict) -> None:
         return
     fo.record(tid, me, "running", repo=repo, branch=task.get("branch", ""),
               run_id=run_id)
-    prompt = (f"You are a fleet offload worker. Repo: {repo or task.get('board')}. "
-              f"Workspace: {wd}. Task: {task.get('title')}. "
-              f"{task.get('body','')}\n\n"
-              "Do the work with tools, commit locally, and summarize exactly what "
-              "you changed. Do not push unless instructed in the task body.")
-    cmd = ["bash", str(WRAPPER), "-p", profile, "chat", "-q", prompt]
-    env = dict(os.environ, HERMES_FLEET_CAP=str(_offload_max()))
+    prompt = _offload_prompt(task, wd, repo)
+    cmd = _worker_argv(profile, prompt)
+    env = _run_env(tid, me, run_id)
     cmd = _wrap_cgroup(cmd)
     try:
         p = subprocess.Popen(cmd, cwd=str(wd) if wd.exists() else str(HERMES),
@@ -825,16 +1097,29 @@ def tick(state: dict) -> None:
     # Release timed-out holds BEFORE re-holding, so a peer that never acked
     # frees the card this tick rather than staying blocked indefinitely.
     release_stale_holds(state, now)
-    held = apply_holds(state, winners, now)
+    held = apply_holds(state, winners, now, peers=peers, health=health)
     if held:
         print(f"[fleet-sched] held {held} local task(s) for offload")
     cap = _offload_max()
+    # Count LIVE offload workers (including orphans from a prior scheduler
+    # process) so a restart cannot oversubscribe the node.
+    running_pids = {p.pid for p in _running.values()}
+    in_flight = len(running_pids | _active_offload_pids())
     my_headroom = fq.headroom(health)
     for tid, task in list(state.get("tasks", {}).items()):
         if task.get("done") or tid in _running:
             continue
         winner = winners.get(tid)
         if winner == me:
+            # Never execute a task this node cannot run (no fit profile / missing
+            # repo). A claim can be won while permissive or on another node's
+            # behalf; spawning here would fail on arrival and write the card back
+            # to `blocked` (the 2026-10-09 block-loop). Skip without spawning.
+            ok_fit, why_fit = fq.fit_ok(my_fit, task)
+            if not ok_fit:
+                print(f"[fleet-sched] {tid} won but this node is unfit "
+                      f"({why_fit}) — skip")
+                continue
             # D-130 rebalance: if a materially more-idle peer exists, yield this
             # queued task (never a running one) so the peer's challenge wins.
             peer = fq.should_yield(task, health, peers, my_fit, now)
@@ -845,8 +1130,9 @@ def tick(state: dict) -> None:
             if not ok:
                 print(f"[fleet-sched] {tid} owned elsewhere ({why}) — skip")
                 continue
-            if len(_running) < cap:
+            if in_flight < cap:
                 execute(task)
+                in_flight += 1
             continue
         # Non-winner / unclaimed: route() may claim (and challenge an existing
         # claim) by publishing this node's headroom. Execution happens on a
