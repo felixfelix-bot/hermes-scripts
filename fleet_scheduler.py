@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -456,6 +457,46 @@ def _card_holdable(board: str, tid: str) -> bool:
     return _card_status(board, tid) in _HOLDABLE_STATUSES
 
 
+_RE_BLOCK_BODY = re.compile(r"^BLOCKED: fleet-offload:([A-Za-z0-9._-]+)$")
+
+
+def _fleet_block_ts(board: str, tid: str, now: float,
+                    ttl: float) -> "tuple[str, float] | None":
+    """Return ``(winner, ts)`` when `tid` still carries OUR recent offload hold.
+
+    The kernel stores a block's reason only as a ``BLOCKED: fleet-offload:<node>``
+    comment (the tasks table has no block_reason column), so the card's comment
+    trail is the authoritative record. Only the NEWEST fleet-offload comment is
+    considered, and only while it is younger than `ttl`: that keeps a recently
+    re-advertised card from being blocked (and commented) a second time while
+    never re-adopting the September backlog of dead holds.
+    """
+    if not board or not tid:
+        return None
+    try:
+        import sqlite3
+        db = HERMES / "kanban" / "boards" / board / "kanban.db"
+        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = c.execute(
+                "select body, created_at from task_comments where task_id=? and "
+                "body like 'BLOCKED: fleet-offload:%' order by id desc limit 1",
+                (tid,)).fetchone()
+        finally:
+            c.close()
+    except Exception:  # noqa: BLE001 — unreadable DB: caller falls back to blocking
+        return None
+    if not row:
+        return None
+    m = _RE_BLOCK_BODY.match(str(row[0] or "").strip())
+    if not m:
+        return None
+    ts = float(row[1] or 0)
+    if ttl > 0 and now - ts > ttl:
+        return None
+    return m.group(1), ts
+
+
 def _db_in_flight(board: str, tid: str, now: float) -> bool:
     """True when this node's board DB shows a live run for `tid`.
 
@@ -576,6 +617,19 @@ def apply_holds(state: dict, winners: dict, now: float | None = None, *,
         # run-id-guarded complete/block/review then all refuse (t_81cb7a13).
         if _has_local_run(info, now):
             continue
+        # Dedupe (t_00fa8726): the card is holdable again but may ALREADY carry
+        # our `fleet-offload` hold from an earlier tick — the state entry lost
+        # `held` (purge, _prune_state eviction, scheduler restart) or another
+        # writer promoted/re-opened the card. Blocking again appends a second
+        # `BLOCKED: fleet-offload:<winner>` comment, and the kernel counts
+        # repeats (`block_loop_detected`) and then ARCHIVES the card, which is
+        # how t_a8fcf378 (recurrences=2) and t_67f3b03e (recurrences=3) died.
+        # Adopt the live block instead of rewriting it.
+        existing = _fleet_block_ts(info.get("board"), tid, now, _hold_ttl())
+        if existing and existing[0] == winner:
+            info["held"] = winner
+            info["held_ts"] = existing[1]
+            continue
         denied_for = denied.get(tid) or {}
         had_deny = bool(denied_for.get(winner))
         if had_deny:
@@ -629,6 +683,13 @@ def release_stale_holds(state: dict, now: float | None = None) -> int:
         # on todo/triage cards churned `hermes kanban unblock` forever.)
         _st = _card_status(info.get("board"), tid)
         if _st is not None and _st not in _UNBLOCKABLE_STATUSES:
+            # Nothing to unblock: another writer already released/promoted the
+            # card. Deny the winner anyway — dropping the hold WITHOUT the
+            # guard is the t_00fa8726 root cause: apply_holds() then re-blocks
+            # on the very next tick and the kernel appends a SECOND
+            # `BLOCKED: fleet-offload:<winner>` comment, which is what tripped
+            # block_loop_detected on t_a8fcf378 (gap 2.9h) and t_67f3b03e.
+            denied.setdefault(tid, {})[winner] = now + ttl
             info["held"] = None
             info.pop("held_ts", None)
             info.pop("held_at", None)
