@@ -19,7 +19,9 @@
         "secrets_clean",
         "pr_branch_naming",
         "no_live_drift",
-        "playbook_check"
+        "playbook_check",
+        "pcb_review",
+        "pcb_consult"
       ],
       "review": {
         "required": true,
@@ -45,7 +47,7 @@
       }
     },
     "recon": {
-      "_comment": "D-165: read-only recon / inventory / measurement cards (no repo, no commit, no PR, no CI workflow). Advisory — it can never block a card. Keeps the two checks that ARE meaningful for read-only work: a written review artifact and an independently re-scanned clean secret scan. tests_green/ci_evidence/push are deliberately NOT required because they are structurally impossible for this class of work.",
+      "_comment": "D-165: read-only recon / inventory / measurement cards (no repo, no commit, no PR, no CI workflow). Advisory \u2014 it can never block a card. Keeps the two checks that ARE meaningful for read-only work: a written review artifact and an independently re-scanned clean secret scan. tests_green/ci_evidence/push are deliberately NOT required because they are structurally impossible for this class of work.",
       "enforce": "advisory",
       "coverage_threshold": 0,
       "require": [
@@ -58,7 +60,7 @@
       }
     },
     "delivery": {
-      "_comment": "D-144 (2026-10-05): delivery-only cards publish an artifact instead of shipping code, so code gates (tests_green, ci_evidence, consolidated) are unsatisfiable. A done card was re-dispatched every 10 minutes for exactly this reason, burning a worker session per pass on a merged deliverable. HARDENED 2026-10-06: `delivery_evidence` reads ONLY the card result + comments written after completion, never the aggregate blob (which leads with the card's own 'post it to <URL>' instructions), and only credits host-anchored URLs on hosts that could resolve. `delivery`/`evidence` are no longer tags — they are ordinary English words, and one line of body text must not skip the code tier.",
+      "_comment": "D-144 (2026-10-05): delivery-only cards publish an artifact instead of shipping code, so code gates (tests_green, ci_evidence, consolidated) are unsatisfiable. A done card was re-dispatched every 10 minutes for exactly this reason, burning a worker session per pass on a merged deliverable. HARDENED 2026-10-06: `delivery_evidence` reads ONLY the card result + comments written after completion, never the aggregate blob (which leads with the card's own 'post it to <URL>' instructions), and only credits host-anchored URLs on hosts that could resolve. `delivery`/`evidence` are no longer tags \u2014 they are ordinary English words, and one line of body text must not skip the code tier.",
       "enforce": "block",
       "coverage_threshold": 0,
       "require": [
@@ -88,7 +90,7 @@
   },
   "board_tiers": {},
   "task_waivers": {
-    "_comment": "Operator-approved per-task carve-outs. Key = 'board:task' (or bare task). A listed task returns verdict=waived and skips ALL code-tier gates — used only where the deliverable is genuinely done/merged/CI-green but some mandatory gates are structurally unsatisfiable (ci_evidence tooling reads ngit while the repo is GitHub-Actions-routed; pr_branch_naming vs a D-116-mandated non-pr/ branch). Additions require an explicit operator decision; the MANDATORY_CODE_GATES floor holds for every other card."
+    "_comment": "Operator-approved per-task carve-outs. Key = 'board:task' (or bare task). A listed task returns verdict=waived and skips ALL code-tier gates \u2014 used only where the deliverable is genuinely done/merged/CI-green but some mandatory gates are structurally unsatisfiable (ci_evidence tooling reads ngit while the repo is GitHub-Actions-routed; pr_branch_naming vs a D-116-mandated non-pr/ branch). Additions require an explicit operator decision; the MANDATORY_CODE_GATES floor holds for every other card."
   },
   "families": {
     "glm": "zhipu",
