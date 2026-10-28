@@ -136,12 +136,14 @@ def check_conn(conn: sqlite3.Connection, timeout_s: int) -> tuple[str, str]:
         pass
     try:
         rows = [str(r[0]) for r in conn.execute("PRAGMA quick_check;")]
-    except sqlite3.OperationalError as exc:
+    except sqlite3.Error as exc:
+        # An exception means the probe did not obtain a complete quick_check
+        # result.  Busy locks, transient I/O faults and resource exhaustion are
+        # operational failures, not proof of corrupt pages.  Only returned
+        # quick_check rows may classify a store as corrupted.
         if "interrupt" in str(exc).lower():
             return "unknown", f"quick_check timeout after {timeout_s}s"
-        return "corrupted", f"sqlite error: {exc}"
-    except sqlite3.DatabaseError as exc:
-        return "corrupted", f"sqlite error: {exc}"
+        return "unknown", f"quick_check failed: {exc}"
     finally:
         try:
             conn.set_progress_handler(None, 0)
@@ -161,7 +163,9 @@ def check_conn_ro(path: Path, timeout_s: int = LIVE_TIMEOUT_S) -> tuple[str, str
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
                                timeout=max(1.0, min(timeout_s / 3.0, 10.0)))
     except sqlite3.Error as exc:
-        return "corrupted", f"open failed: {exc}"
+        # Opening itself is not an integrity proof: locks, I/O and resource
+        # failures must not enter the destructive repair pipeline.
+        return "unknown", f"open failed: {exc}"
     try:
         return check_conn(conn, timeout_s)
     finally:

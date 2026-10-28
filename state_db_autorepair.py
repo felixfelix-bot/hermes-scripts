@@ -36,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from state_db_health import classify_db, find_state_dbs  # noqa: E402
+from state_db_health import check_conn_ro, find_state_dbs, snapshot_db  # noqa: E402
 
 HERMES = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
 BOT = HERMES / "bot"
@@ -163,16 +163,65 @@ def pick_best(entries: list[dict]) -> dict | None:
     return good[-1]
 
 
-def may_apply(policy: dict, best: dict | None) -> tuple[bool, str]:
+def may_apply(policy: dict, best: dict | None,
+              incumbent_messages: int | None = None) -> tuple[bool, str]:
+    """Decide whether a verified recovery may replace the incumbent.
+
+    Partial recovery is exceptional: it must be explicitly enabled and retain a
+    meaningful fraction of the incumbent rather than merely clearing an absolute
+    message floor.  This prevents a tiny salvage DB from replacing a much larger
+    readable store after a transient false-positive health probe.
+    """
     if best is None:
         return False, "no recoverable candidate"
     if not best.get("verified") or not best.get("healthy"):
         return False, "recovery not verified/healthy"
-    if policy.get("require_lossless") and best.get("loss_detected"):
-        return False, "recovery is partial (loss_detected=true); not auto-applied"
-    if not best.get("messages"):
+    messages = int(best.get("messages") or 0)
+    if messages <= 0:
         return False, "recovery has no messages"
+    if best.get("loss_detected"):
+        if policy.get("require_lossless") or not policy.get("allow_lossy", False):
+            return False, "recovery is partial (loss_detected=true); not auto-applied"
+        if incumbent_messages is None or incumbent_messages <= 0:
+            return False, "partial recovery incumbent message count unavailable"
+        fraction = float(policy.get("min_recovery_fraction", 0.5))
+        minimum = max(1, int(incumbent_messages * fraction))
+        if messages < minimum:
+            return False, (f"partial recovery has {messages}/{incumbent_messages} messages; "
+                           f"requires >= {minimum} ({fraction:.0%})")
     return True, "ok"
+
+
+def incumbent_message_count(db: Path) -> int | None:
+    """Read the incumbent message count without treating a read failure as zero."""
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        try:
+            return int(conn.execute("SELECT count(*) FROM messages").fetchone()[0])
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def snapshot_confirmed_corrupt(db: Path, work: Path) -> tuple[bool, str]:
+    """Require an independent snapshot quick_check before any repair attempt."""
+    snapshot = work / f"{db.parent.name}-confirmation.db"
+    try:
+        snapshot.unlink(missing_ok=True)
+        snapshot_db(db, snapshot, timeout_s=120)
+        verdict, detail = check_conn_ro(snapshot, timeout_s=120)
+        if verdict == "corrupted":
+            return True, f"snapshot-confirmed: {detail}"
+        return False, f"snapshot verdict {verdict}: {detail}"
+    except (OSError, sqlite3.Error, TimeoutError) as exc:
+        return False, f"snapshot confirmation failed: {exc}"
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(str(snapshot) + suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _worker_running() -> bool:
@@ -252,14 +301,14 @@ def run(apply: bool, profile: str | None = None) -> dict:
     if len(_recent_actions(state, now, policy["window_s"])) >= policy["budget"]:
         result["blocked"].append("budget")
 
-    # Prefer the recorded health result; else recompute a targeted check.
+    # A live health sample only nominates candidates.  The destructive recovery
+    # path below requires a second, independent snapshot confirmation.
     health = _read_json(HEALTH_STATE, None)
     corrupt_profiles = set((health or {}).get("corrupt") or [])
     dbs = find_state_dbs(profile)
-    targets = [(name, p) for name, p in dbs
-               if name in corrupt_profiles or classify_db(p)["verdict"] == "corrupted"]
+    targets = [(name, p) for name, p in dbs if name in corrupt_profiles]
     if not targets:
-        result["detail"] = "no corrupt state.db"
+        result["detail"] = "no snapshot-confirmed corrupt state.db candidates"
         return result
 
     hermes = find_hermes()
@@ -271,6 +320,15 @@ def run(apply: bool, profile: str | None = None) -> dict:
     for name, db in targets:
         entry = {"profile": name, "path": str(db), "candidates": [], "best": None,
                  "applied": False, "detail": ""}
+        confirmed, confirmation = snapshot_confirmed_corrupt(db, WORK)
+        entry["snapshot_confirmation"] = confirmation
+        if not confirmed:
+            entry["detail"] = confirmation
+            result["profiles"].append(entry)
+            result["performed"].append(entry)
+            continue
+        incumbent_messages = incumbent_message_count(db)
+        entry["incumbent_messages"] = incumbent_messages
         for i, cand in enumerate(collect_candidates(db, policy["candidate_globs"])):
             out = WORK / f"{name}-{i}.db"
             rep = run_recover(hermes, cand, out, policy["allow_partial"])
@@ -280,7 +338,7 @@ def run(apply: bool, profile: str | None = None) -> dict:
         entry["best"] = ({k: best.get(k) for k in
                           ("source", "messages", "sessions", "loss_detected",
                            "healthy", "verified")} if best else None)
-        ok, why = may_apply(policy, best)
+        ok, why = may_apply(policy, best, incumbent_messages)
         entry["detail"] = why
         if ok and apply and not result["blocked"]:
             entry["applied"] = True

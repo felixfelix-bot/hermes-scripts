@@ -1,0 +1,1 @@
+2026-10-28: Cloned hermes-scripts into isolated worktree; current classifier labels read/open errors corrupted and autorepair trusts single health verdict. → implementing unknown mapping, snapshot confirmation, and incumbent-count recovery gate → state_db_health.py, state_db_autorepair.py, regression tests.
