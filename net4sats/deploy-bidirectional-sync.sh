@@ -111,8 +111,14 @@ echo "delta-sync behavior. DQ05 gets its full baseline via SSHFS (M2b), then rec
 echo "future deltas over Nostr. To force a full re-publish, delete"
 echo "~/.hermes/state/kanban-nostr-outbound.json and re-run '--seed' on each machine."
 echo
-echo "Relays: wss://relay.damus.io wss://nos.lol wss://relay.ngit.dev  (kind 38010,"
-echo "parameterized replaceable per NIP-33; d-tag = <hostname>:<board>:<entity>)."
+echo "Relays (DEFAULT_RELAYS in kanban-nostr-replicate.py): wss://relay.damus.io,"
+echo "wss://relay.ngit.dev  — kind 38010, parameterized replaceable per NIP-33;"
+echo "d-tag = <hostname>:<board>:<entity>)."
+echo "2026-10-29: nos.lol REMOVED from DEFAULT_RELAYS — unreachable from this host"
+echo "(IPv6 NAT64 only, TCP/443 fails). relay.ngit.dev accepts connections but"
+echo "REJECTS kanban events ('restricted: must reference an accepted repository'),"
+echo "so it is effectively a dead relay for this sync — pick a transport before"
+echo "re-enabling outbound (see M2b, t_a9952b7f)."
 echo "Board 'art-jeff' is in EXCLUDE_BOARDS and is never published or applied."
 echo
 echo "To roll back: restore the .bak.$TS files in $DST"

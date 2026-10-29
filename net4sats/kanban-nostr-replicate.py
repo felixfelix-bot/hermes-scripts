@@ -45,8 +45,11 @@ HERMES_HOME = os.path.expanduser("~/.hermes")
 BOARDS_DIR = os.path.join(HERMES_HOME, "kanban", "boards")
 STATE_DIR = os.path.join(HERMES_HOME, "state")
 
-# Nostr relays — same as existing kanbanstr scripts
-DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.ngit.dev"]
+# Nostr relays — same as existing kanbanstr scripts.
+# nos.lol was dropped 2026-10-29: from this host it resolves to an IPv6 NAT64
+# address only and TCP/443 to it fails, so every publish that included it came
+# back non-zero. relay.damus.io and relay.ngit.dev connect fine.
+DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://relay.ngit.dev"]
 
 # Event kind for Hermes kanban sync (parameterized replaceable, NIP-33 range)
 KANBAN_KIND = 38010
@@ -112,6 +115,23 @@ def list_boards():
     return boards
 
 
+def json_safe(value):
+    """Coerce a DB value into something json.dumps() can always encode.
+
+    Some live board rows carry a BLOB in what is nominally a TEXT column
+    (2026-10-29: balloon/t_0f129db4 and tollgate-module-basic-go/t_899378d5
+    both had a binary `body`). json.dumps() raises TypeError on bytes, which
+    aborted the ENTIRE outbound run — one bad row silently stopped sync for
+    every board sorted after it. Decode as UTF-8 (lossy for genuinely binary
+    payloads) so a corrupt row can never take the sync down.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", "replace")
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def task_hash(row_dict):
     """Stable hash of a task's logical columns for change detection."""
     parts = []
@@ -171,7 +191,15 @@ def save_state(name, data):
 
 
 def nak_publish(secret_key, kind, content, tags, relays):
-    """Publish a Nostr event via nak. Returns True on success."""
+    """Publish a Nostr event via nak. Returns True if a relay accepted it.
+
+    nak exits 0 as soon as it MANAGED TO CONNECT to one relay — a relay that
+    then rejects or times out the publish still yields rc=0, which made the
+    old rc-only check report success for events that were never stored.
+    Success is therefore judged on nak's per-relay output lines
+    ("publishing to <relay>... success."), falling back to the exit code when
+    an unfamiliar nak build prints nothing.
+    """
     # Build partial event JSON for stdin; nak fills in pubkey/sig/kind
     template = json.dumps({"content": content, "tags": tags})
     cmd = ["nak", "event", "--sec", secret_key, "-k", str(kind)] + relays
@@ -179,9 +207,31 @@ def nak_publish(secret_key, kind, content, tags, relays):
         r = subprocess.run(
             cmd, input=template, capture_output=True, text=True, timeout=30
         )
-        return r.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
+
+    out = (r.stdout or "") + (r.stderr or "")
+    delivered = failed = 0
+    for line in out.splitlines():
+        if not line.startswith("publishing to"):
+            continue
+        if "success" in line:
+            delivered += 1
+        elif "failed" in line:
+            failed += 1
+
+    if delivered:
+        if failed:
+            print(
+                f"  ⚠️ kind {kind}: {delivered} relay(s) stored, "
+                f"{failed} failed — event kept",
+                file=sys.stderr,
+            )
+        return True
+    if failed:
+        print(f"  ⚠️ kind {kind}: no relay stored the event", file=sys.stderr)
+        return False
+    return r.returncode == 0
 
 
 def nak_fetch(kind, tag_filters, relays, timeout=45):
@@ -257,7 +307,7 @@ def seed():
         bstate["last_event_id"] = max_ev
         bstate["last_comment_id"] = max_cmt
         bstate["task_hashes"] = {
-            t["id"]: task_hash({col: t[col] for col in TASK_SYNC_COLUMNS})
+            t["id"]: task_hash({col: json_safe(t[col]) for col in TASK_SYNC_COLUMNS})
             for t in tasks
         }
         bstate["links"] = [[r["parent_id"], r["child_id"]] for r in links]
@@ -294,7 +344,7 @@ def publish_single_task(secret_key, relays, board, task_id):
         print(f"Task '{task_id}' not found on board '{board}'", file=sys.stderr)
         sys.exit(1)
 
-    row_dict = {col: row[col] for col in TASK_SYNC_COLUMNS}
+    row_dict = {col: json_safe(row[col]) for col in TASK_SYNC_COLUMNS}
     eff_ts = max(
         to_epoch(row_dict.get("created_at")),
         to_epoch(row_dict.get("started_at")),
@@ -319,15 +369,38 @@ def publish_single_task(secret_key, relays, board, task_id):
 # ─── Outbound: detect + publish local changes ────────────────────────────────
 
 
-def outbound(secret_key, relays, dry_run=False):
-    """Detect local kanban changes and publish them to Nostr."""
+def outbound(secret_key, relays, dry_run=False, max_publish=None):
+    """Detect local kanban changes and publish them to Nostr.
+
+    max_publish bounds a single run so a long backlog (e.g. the 40 days of
+    deltas that accumulate while the outbound cron is disabled) cannot run
+    past the cron script timeout and die without persisting any watermark —
+    which made outbound restart from the same place forever. State is
+    persisted per board and again when the cap trips, so successive runs
+    drain the backlog: last_event_id only advances once a board's task loop
+    finishes, and task_hashes keep already-published tasks from being resent.
+    """
     hn = hostname()
     state = load_state("kanban-nostr-outbound.json")
     published = 0
 
+    def _cap_reached():
+        if not max_publish or published < max_publish:
+            return False
+        if not dry_run:
+            save_state("kanban-nostr-outbound.json", state)
+        print(
+            f"⏸  publish cap ({max_publish}) reached after {published} event(s)"
+            f"{' (dry-run: nothing saved)' if dry_run else ''} — remaining"
+            " deltas resume on the next run"
+        )
+        return True
+
     for board in list_boards():
         if board in EXCLUDE_BOARDS:
             continue  # never publish privacy-sensitive boards
+        if _cap_reached():
+            return
         db_path = board_db_path(board)
         bstate = state.setdefault(board, {
             "last_event_id": 0,
@@ -364,6 +437,9 @@ def outbound(secret_key, relays, dry_run=False):
 
         # ── Publish changed task snapshots ──
         for tid in sorted(changed_task_ids):
+            if _cap_reached():
+                conn.close()
+                return
             row = c.execute(
                 f"SELECT {', '.join(TASK_SYNC_COLUMNS)} FROM tasks WHERE id = ?",
                 (tid,),
@@ -372,7 +448,7 @@ def outbound(secret_key, relays, dry_run=False):
                 # Task was deleted/archived — skip (we don't sync deletions yet)
                 continue
 
-            row_dict = {col: row[col] for col in TASK_SYNC_COLUMNS}
+            row_dict = {col: json_safe(row[col]) for col in TASK_SYNC_COLUMNS}
             h = task_hash(row_dict)
 
             if bstate["task_hashes"].get(tid) == h:
@@ -428,11 +504,11 @@ def outbound(secret_key, relays, dry_run=False):
                     ["ts", str(to_epoch(cmt["created_at"]))],
                 ]
                 content = json.dumps({
-                    "id": cmt["id"],
-                    "task_id": cmt["task_id"],
-                    "author": cmt["author"],
-                    "body": cmt["body"],
-                    "created_at": cmt["created_at"],
+                    "id": json_safe(cmt["id"]),
+                    "task_id": json_safe(cmt["task_id"]),
+                    "author": json_safe(cmt["author"]),
+                    "body": json_safe(cmt["body"]),
+                    "created_at": json_safe(cmt["created_at"]),
                 })
                 if nak_publish(secret_key, KANBAN_KIND, content, tags, relays):
                     published += 1
@@ -456,8 +532,8 @@ def outbound(secret_key, relays, dry_run=False):
                         ["ts", str(int(time.time()))],
                     ]
                     content = json.dumps({
-                        "parent_id": link[0],
-                        "child_id": link[1],
+                        "parent_id": json_safe(link[0]),
+                        "child_id": json_safe(link[1]),
                     })
                     if nak_publish(secret_key, KANBAN_KIND, content, tags, relays):
                         published += 1
@@ -466,6 +542,11 @@ def outbound(secret_key, relays, dry_run=False):
             pass
 
         conn.close()
+
+        # Persist after every board: a crash in a later board (or a cron
+        # script timeout) must not discard the boards already published.
+        if not dry_run:
+            save_state("kanban-nostr-outbound.json", state)
 
     if published > 0:
         print(f"📤 Published {published} kanban change(s) to Nostr (kind {KANBAN_KIND})")
@@ -681,6 +762,10 @@ def main():
                       help="Publish a single task snapshot (testing)")
     parser.add_argument("--relays", nargs="*", default=DEFAULT_RELAYS,
                         help="Nostr relay URLs")
+    parser.add_argument("--max-publish", type=int, default=100, metavar="N",
+                        help="Cap events published in one --outbound run "
+                             "(default 100; 0 = unlimited). State is saved "
+                             "when the cap trips so the next run resumes.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Don't publish/apply, just report")
     args = parser.parse_args()
@@ -713,7 +798,8 @@ def main():
         board, task_id = args.publish_task
         publish_single_task(sk, args.relays, board, task_id)
     elif args.outbound:
-        outbound(sk, args.relays, dry_run=args.dry_run)
+        outbound(sk, args.relays, dry_run=args.dry_run,
+                 max_publish=args.max_publish or None)
     elif args.inbound:
         inbound(sk, args.relays, dry_run=args.dry_run)
 

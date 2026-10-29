@@ -24,17 +24,38 @@ from contextlib import redirect_stdout
 WS = os.path.dirname(os.path.abspath(__file__))
 SANDBOX = os.path.join(WS, "sandbox")
 BOARD = "synctest-t36ca6f0f"
-RELAY = "wss://nos.lol"
-DEPLOYED = os.path.expanduser("~/.hermes/profiles/manager/scripts/kanban-nostr-replicate.py")
+# relay.damus.io, not nos.lol: from this host nos.lol resolves to an IPv6
+# NAT64 address only and TCP/443 to it fails, so every relay-dependent check
+# used to fail on a dead relay rather than on the code under test.
+RELAY = os.environ.get("SYNC_TEST_RELAY", "wss://relay.damus.io")
+DEPLOYED = os.environ.get(
+    "SYNC_REPLICATE_PY",
+    os.path.expanduser("~/.hermes/profiles/manager/scripts/kanban-nostr-replicate.py"))
 LIVE_SCHEMA_FROM = os.path.expanduser("~/.hermes/kanban/boards/infrastructure/kanban.db")
 
 FAILS = []
+SKIPS = []
 
 
 def check(name, ok, detail=""):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
     if not ok:
         FAILS.append(name)
+
+
+def skip(name, why):
+    print(f"  [SKIP] {name} — {why}")
+    SKIPS.append(name)
+
+
+def relay_reachable(relay):
+    """True when nak can open a REQ against the relay (connection only)."""
+    try:
+        r = subprocess.run(["nak", "req", "-k", "38010", "-l", "1", relay],
+                           capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    return "connecting to" in (r.stdout + r.stderr) and "ok." in (r.stdout + r.stderr)
 
 
 def load_module():
@@ -134,50 +155,64 @@ def main():
     check("dry-run exits 0", r.returncode == 0, f"rc={r.returncode}")
     check("no traceback", "Traceback" not in r.stderr, r.stderr.strip()[-200:])
 
-    print("\n== 3. publish sandbox tasks to a real relay")
-    for tid in ("t_synctest_iso", "t_synctest_int"):
-        try:
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                mod.publish_single_task(sk, [RELAY], BOARD, tid)
-            out = buf.getvalue().strip()
-        except SystemExit:
-            out = "SystemExit (publish failed)"
-        check(f"published {tid}", "✅ Published" in out, out[-120:])
+    reachable = relay_reachable(RELAY)
+    RELAY_CHECKS = [
+        "published t_synctest_iso", "published t_synctest_int",
+        "relay returns sandbox events",
+        "peer snapshot applied (title restored)",
+        "peer snapshot applied (status restored)",
+        "inbound reported an apply",
+        "second inbound run is a no-op (dedupe)",
+    ]
+    if not reachable:
+        print(f"\n== 3-5. relay-dependent checks SKIPPED — {RELAY} unreachable")
+        for name in RELAY_CHECKS:
+            skip(name, f"{RELAY} unreachable from this host")
+    else:
+        print("\n== 3. publish sandbox tasks to a real relay")
+        for tid in ("t_synctest_iso", "t_synctest_int"):
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    mod.publish_single_task(sk, [RELAY], BOARD, tid)
+                out = buf.getvalue().strip()
+            except SystemExit:
+                out = "SystemExit (publish failed)"
+            check(f"published {tid}", "✅ Published" in out, out[-120:])
 
-    print("\n== 4. event is retrievable from the relay")
-    r = subprocess.run(["nak", "req", "-k", str(mod.KANBAN_KIND),
-                        "-t", f"b={BOARD}", RELAY],
-                       capture_output=True, text=True, timeout=60)
-    ids = [json.loads(l).get("id") for l in r.stdout.strip().splitlines() if l.strip()]
-    check("relay returns sandbox events", len(ids) >= 2, f"{len(ids)} event(s)")
+        print("\n== 4. event is retrievable from the relay")
+        r = subprocess.run(["nak", "req", "-k", str(mod.KANBAN_KIND),
+                            "-t", f"b={BOARD}", RELAY],
+                           capture_output=True, text=True, timeout=60)
+        ids = [json.loads(l).get("id") for l in r.stdout.strip().splitlines() if l.strip()]
+        check("relay returns sandbox events", len(ids) >= 2, f"{len(ids)} event(s)")
 
-    print("\n== 5. inbound apply as the PEER (hostname faked to DQ05)")
-    # make the local copy stale so LWW must accept the peer snapshot
-    con = sqlite3.connect(db)
-    con.execute("UPDATE tasks SET title='LOCAL-STALE', status='blocked', created_at=1000000000,"
-                " started_at=NULL, completed_at=NULL WHERE id='t_synctest_int'")
-    con.commit()
-    con.close()
+        print("\n== 5. inbound apply as the PEER (hostname faked to DQ05)")
+        # make the local copy stale so LWW must accept the peer snapshot
+        con = sqlite3.connect(db)
+        con.execute("UPDATE tasks SET title='LOCAL-STALE', status='blocked', created_at=1000000000,"
+                    " started_at=NULL, completed_at=NULL WHERE id='t_synctest_int'")
+        con.commit()
+        con.close()
 
-    mod.hostname = lambda: "c03rad0r-DQ05proplus"
-    mod.BOARDS_DIR = os.path.join(SANDBOX, "boards")
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        mod.inbound(sk, [RELAY])
-    out1 = buf.getvalue()
-    con = sqlite3.connect(db)
-    row = con.execute("SELECT title,status,created_at FROM tasks WHERE id='t_synctest_int'").fetchone()
-    con.close()
-    check("peer snapshot applied (title restored)", row[0] == "sandbox int-ts task", str(row))
-    check("peer snapshot applied (status restored)", row[1] == "ready", str(row))
-    check("inbound reported an apply", "📥 Applied" in out1, out1.strip()[-120:])
+        mod.hostname = lambda: "c03rad0r-DQ05proplus"
+        mod.BOARDS_DIR = os.path.join(SANDBOX, "boards")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mod.inbound(sk, [RELAY])
+        out1 = buf.getvalue()
+        con = sqlite3.connect(db)
+        row = con.execute("SELECT title,status,created_at FROM tasks WHERE id='t_synctest_int'").fetchone()
+        con.close()
+        check("peer snapshot applied (title restored)", row[0] == "sandbox int-ts task", str(row))
+        check("peer snapshot applied (status restored)", row[1] == "ready", str(row))
+        check("inbound reported an apply", "📥 Applied" in out1, out1.strip()[-120:])
 
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        mod.inbound(sk, [RELAY])
-    out2 = buf.getvalue()
-    check("second inbound run is a no-op (dedupe)", "📥 Applied" not in out2, out2.strip()[-120:])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mod.inbound(sk, [RELAY])
+        out2 = buf.getvalue()
+        check("second inbound run is a no-op (dedupe)", "📥 Applied" not in out2, out2.strip()[-120:])
 
     print("\n== 6. inbound dry-run against live state (no crash)")
     r = subprocess.run([sys.executable, DEPLOYED, "--inbound", "--dry-run"],
@@ -192,8 +227,12 @@ def main():
 def finish():
     print()
     if FAILS:
-        print(f"RESULT: {len(FAILS)} FAILURE(S): {FAILS}")
+        print(f"RESULT: {len(FAILS)} FAILURE(S): {FAILS}"
+              + (f" ({len(SKIPS)} skipped: {SKIPS})" if SKIPS else ""))
         return 1
+    if SKIPS:
+        print(f"RESULT: ALL EXECUTED CHECKS PASSED — {len(SKIPS)} SKIPPED: {SKIPS}")
+        return 0
     print("RESULT: ALL CHECKS PASSED")
     return 0
 
